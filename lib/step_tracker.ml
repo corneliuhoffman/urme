@@ -36,7 +36,7 @@ let get t n =
   List.find_opt (fun s -> s.number = n) t.steps
 
 let get_by_sha t sha =
-  List.find_opt (fun s -> s.commit_sha = sha) t.steps
+  List.find_opt (fun (s : step) -> s.commit_sha = sha) t.steps
 
 let all t = t.steps
 
