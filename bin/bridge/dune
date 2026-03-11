@@ -1,0 +1,4 @@
+(executable
+ (name permission_bridge)
+ (public_name urme-permission-bridge)
+ (libraries yojson lwt lwt.unix))

@@ -1,4 +1,5 @@
 open Lwt.Syntax
+open Urme_core
 
 (* Irmin-git store for reading the project's .git directory *)
 module Store = Irmin_git_unix.FS.KV (Irmin.Contents.String)

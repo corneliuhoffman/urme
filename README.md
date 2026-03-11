@@ -198,3 +198,7 @@ When the user says "replay experience ...":
 - Call mcp__experience__replay_experience with the user's description
 - Present the returned steps and conversations for reference
 ```
+
+## Author
+
+Corneliu Hoffman, 2026

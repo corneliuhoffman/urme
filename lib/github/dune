@@ -1,0 +1,3 @@
+(library
+ (name urme_github)
+ (libraries urme_core yojson cohttp-lwt-unix lwt))

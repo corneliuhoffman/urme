@@ -1,0 +1,3 @@
+(library
+ (name urme_tui)
+ (libraries urme_core urme_claude urme_git urme_search cohttp-lwt-unix lambda-term lwt lwt.unix))

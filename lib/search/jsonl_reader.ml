@@ -1,4 +1,4 @@
-open Types
+open Urme_core.Types
 
 (* Compute the JSONL directory for a project *)
 let find_jsonl_dir ~project_dir =
@@ -13,7 +13,20 @@ let find_jsonl_dir ~project_dir =
   let home = Sys.getenv "HOME" in
   Filename.concat home (Filename.concat ".claude" (Filename.concat "projects" encoded))
 
-(* List session JSONL files sorted by mtime, newest first *)
+(* Read the timestamp from the first line of a JSONL file *)
+let first_line_timestamp path =
+  try
+    let ic = open_in path in
+    let line = input_line ic in
+    close_in ic;
+    let json = Yojson.Safe.from_string line in
+    let open Yojson.Safe.Util in
+    (match json |> member "timestamp" |> to_string_option with
+     | Some ts -> ts
+     | None -> "")
+  with _ -> ""
+
+(* List session JSONL files sorted by first-message timestamp, newest first *)
 let list_sessions ~jsonl_dir =
   if not (Sys.file_exists jsonl_dir) then []
   else
@@ -21,16 +34,16 @@ let list_sessions ~jsonl_dir =
     let jsonl_files = List.filter (fun f ->
       Filename.check_suffix f ".jsonl"
     ) entries in
-    let with_mtime = List.filter_map (fun f ->
+    let with_ts = List.filter_map (fun f ->
       let path = Filename.concat jsonl_dir f in
-      try
-        let stat = Unix.stat path in
-        Some (path, stat.Unix.st_mtime)
-      with _ -> None
+      if Sys.file_exists path then
+        let ts = first_line_timestamp path in
+        Some (path, ts)
+      else None
     ) jsonl_files in
     let sorted = List.sort (fun (_, t1) (_, t2) ->
-      Float.compare t2 t1  (* newest first *)
-    ) with_mtime in
+      String.compare t2 t1  (* newest first, ISO timestamps sort lexically *)
+    ) with_ts in
     List.map fst sorted
 
 (* Get the current (most recent) session JSONL file *)

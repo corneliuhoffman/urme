@@ -1,0 +1,3 @@
+(library
+ (name urme_core)
+ (libraries yojson uuidm cohttp-lwt-unix lwt lwt.unix))

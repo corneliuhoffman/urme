@@ -1,5 +1,5 @@
 open Lwt.Syntax
-open Types
+open Urme_core.Types
 
 let tenant = "default_tenant"
 let database = "default_database"
@@ -359,6 +359,46 @@ let search_interactions ~port ~collection_id ~experience_id ~query ~n =
         let user_uuid = meta |> member "user_uuid" |> to_string_option
           |> Option.value ~default:"" in
         (idx, user_uuid, distance))
+
+(* Search all interactions across all sessions *)
+let search_all_interactions ~port ~collection_id ~query ~n =
+  let* embedding = embed_text query in
+  let body = `Assoc [
+    "query_embeddings", `List [`List (List.map (fun f -> `Float f) embedding)];
+    "n_results", `Int n;
+    "include", `List [`String "documents"; `String "metadatas"; `String "distances"];
+  ] in
+  let+ resp = http_post ~port
+    ~path:(Printf.sprintf "/collections/%s/query" collection_id) ~body in
+  let open Yojson.Safe.Util in
+  let ids_outer = resp |> member "ids" |> safe_to_list in
+  match ids_outer with
+  | [] -> []
+  | first_ids :: _ ->
+    let ids = first_ids |> safe_to_list |> List.map to_string in
+    let distances = (resp |> member "distances" |> safe_to_list
+      |> function [] -> [] | d :: _ -> d |> safe_to_list |> List.map to_float) in
+    let metadatas = (resp |> member "metadatas" |> safe_to_list
+      |> function [] -> [] | m :: _ -> m |> safe_to_list) in
+    let documents = (resp |> member "documents" |> safe_to_list
+      |> function [] -> [] | d :: _ -> d |> safe_to_list
+         |> List.map (fun j -> to_string_option j |> Option.value ~default:"")) in
+    if ids = [] then []
+    else
+      let combine4 a b c d =
+        List.map2 (fun (a,b) (c,d) -> (a,b,c,d))
+          (List.combine a b) (List.combine c d) in
+      combine4 ids distances metadatas documents
+      |> List.map (fun (_id, distance, meta, doc) ->
+        let session_id = meta |> member "experience_id" |> to_string_option
+          |> Option.value ~default:"" in
+        let user_text = meta |> member "user_text" |> to_string_option
+          |> Option.value ~default:"" in
+        let timestamp = meta |> member "timestamp" |> to_string_option
+          |> Option.value ~default:"" in
+        let interaction_index = meta |> member "interaction_index" |> to_int_option
+          |> Option.value ~default:0 in
+        (session_id, user_text, doc, interaction_index, timestamp, distance))
 
 (* Delete all interaction documents for an experience *)
 let delete_interactions ~port ~collection_id ~experience_id =

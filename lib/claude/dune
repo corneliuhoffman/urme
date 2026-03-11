@@ -1,0 +1,3 @@
+(library
+ (name urme_claude)
+ (libraries urme_core yojson lwt lwt.unix))

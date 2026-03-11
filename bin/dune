@@ -1,4 +1,4 @@
 (executable
  (name main)
- (public_name experience_agent)
- (libraries experience_agent))
+ (public_name urme)
+ (libraries urme_core urme_git urme_store urme_search urme_claude urme_engine urme_tui cmdliner))

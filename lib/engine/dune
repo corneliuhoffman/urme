@@ -1,0 +1,3 @@
+(library
+ (name urme_engine)
+ (libraries urme_core urme_git urme_store urme_search urme_claude urme_github))

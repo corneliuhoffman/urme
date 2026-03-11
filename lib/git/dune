@@ -1,0 +1,3 @@
+(library
+ (name urme_git)
+ (libraries urme_core lwt lwt.unix))
