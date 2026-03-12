@@ -186,6 +186,8 @@ let default_run project_dir _chromadb_port =
 
 let () =
   Printexc.record_backtrace true;
+  (* Suppress stale-FD errors from background Lwt tasks during shutdown *)
+  Lwt.async_exception_hook := (fun _exn -> ());
   (* Use libev (kqueue on macOS) instead of select() to avoid
      EINVAL when file descriptors exceed FD_SETSIZE (1024). *)
   (try Lwt_engine.set (new Lwt_engine.libev ())

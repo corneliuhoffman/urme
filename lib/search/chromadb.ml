@@ -219,20 +219,19 @@ let search ~port ~collection_id ~query ~n =
       in
       List.sort (fun a b -> Float.compare a.distance b.distance) results
 
-(* Update metadata for an experience (for link_commit and go_back) *)
+(* Update metadata for an experience (for link_commit and go_back).
+   Returns false if the document doesn't exist. *)
 let update_metadata ~port ~collection_id ~id ~updates =
-  (* ChromaDB update: we need to re-add with same embedding *)
-  (* First get the existing document *)
   let get_body = `Assoc [
     "ids", `List [`String id];
-    "include", `List [`String "documents"; `String "metadatas"; `String "embeddings"];
+    "include", `List [`String "metadatas"];
   ] in
   let* resp = http_post ~port
     ~path:(Printf.sprintf "/collections/%s/get" collection_id) ~body:get_body in
   let open Yojson.Safe.Util in
   let ids = resp |> member "ids" |> safe_to_list |> List.map to_string in
   match ids with
-  | [] -> Lwt.return_unit
+  | [] -> Lwt.return false
   | _ ->
     let old_meta = resp |> member "metadatas" |> safe_to_list
       |> List.hd in
@@ -242,7 +241,6 @@ let update_metadata ~port ~collection_id ~id ~updates =
       | Some new_v -> (k, new_v)
       | None -> (k, v)
     ) old_fields in
-    (* Add any new keys from updates not in old_fields *)
     let extra = List.filter (fun (k, _) ->
       not (List.mem_assoc k old_fields)
     ) updates in
@@ -254,7 +252,7 @@ let update_metadata ~port ~collection_id ~id ~updates =
     let+ _resp = http_post ~port
       ~path:(Printf.sprintf "/collections/%s/update" collection_id)
       ~body:update_body in
-    ()
+    true
 
 (* List all experiences *)
 let list_all ~port ~collection_id ~limit =

@@ -284,8 +284,8 @@ type state = {
   history : history_state;
   message_count : int;
   usage : Urme_core.Usage.usage_data option;
-  started_ollama : bool;
   started_chroma : bool;
+  started_ollama : bool;
 }
 
 (* ---------- Helpers ---------- *)
@@ -314,7 +314,7 @@ let initial_state ~config ~project_dir = {
   palette_open = false; palette_selected = 0;
   git = empty_git_state; history = empty_history_state;
   message_count = 0; usage = None;
-  started_ollama = false; started_chroma = false;
+  started_chroma = false; started_ollama = false;
 }
 
 let append_diff s diff =
@@ -1217,7 +1217,11 @@ let make_edit_key ~file_base ~new_string =
 (* Compute diff_hash = hex digest of a raw diff string *)
 let diff_hash_of_string s = Digest.string s |> Digest.to_hex
 
-(* Parse git_info JSON string into a map: edit_key → option (commit_sha, diff_hash) *)
+(* git_info value: (commit_sha, diff_hash, turn_idx, entry_idx) *)
+type git_info_val = { gi_sha : string; gi_dh : string; gi_ti : int; gi_ei : int }
+
+(* Parse git_info JSON string into a map: edit_key → option git_info_val
+   Backwards-compatible: [sha, dh] → ti=0 ei=0; [sha, dh, ti, ei] → full *)
 let parse_git_info s =
   if s = "" then Hashtbl.create 0
   else
@@ -1228,7 +1232,10 @@ let parse_git_info s =
        | `Assoc pairs ->
          List.iter (fun (key, value) ->
            match value with
-           | `List [`String sha; `String dh] -> Hashtbl.replace tbl key (Some (sha, dh))
+           | `List [`String sha; `String dh; `Int ti; `Int ei] ->
+             Hashtbl.replace tbl key (Some { gi_sha = sha; gi_dh = dh; gi_ti = ti; gi_ei = ei })
+           | `List [`String sha; `String dh] ->
+             Hashtbl.replace tbl key (Some { gi_sha = sha; gi_dh = dh; gi_ti = 0; gi_ei = 0 })
            | `Null -> Hashtbl.replace tbl key None
            | _ -> ()
          ) pairs
@@ -1240,7 +1247,7 @@ let parse_git_info s =
 let serialize_git_info tbl =
   let pairs = Hashtbl.fold (fun key value acc ->
     let v = match value with
-      | Some (sha, dh) -> `List [`String sha; `String dh]
+      | Some gi -> `List [`String gi.gi_sha; `String gi.gi_dh; `Int gi.gi_ti; `Int gi.gi_ei]
       | None -> `Null in
     (key, v) :: acc
   ) tbl [] in
@@ -1264,6 +1271,11 @@ let string_find_pos needle haystack =
       else search (i + 1)
     in
     search 0
+
+let log_debug msg =
+  let oc = open_out_gen [Open_append; Open_creat] 0o644 "/tmp/urme_debug.log" in
+  Printf.fprintf oc "[%s] %s\n" (string_of_float (Unix.gettimeofday ())) msg;
+  close_out oc
 
 (* update_git_links: the main 6-phase algorithm *)
 let update_git_links ~project_dir ~port ~collection_id mvar =
@@ -1357,21 +1369,21 @@ let update_git_links ~project_dir ~port ~collection_id mvar =
           let changed = ref false in
           Hashtbl.iter (fun edit_key value ->
             match value with
-            | Some (commit_sha, dh) ->
-              if Hashtbl.mem live_shas commit_sha then begin
+            | Some gi ->
+              if Hashtbl.mem live_shas gi.gi_sha then begin
                 let file_base = match String.split_on_char ':' edit_key with
                   | fb :: _ -> fb | [] -> "" in
-                match Hashtbl.find_opt live_diff_index (file_base, dh) with
-                | Some (found_sha, _) when found_sha = commit_sha -> ()
+                match Hashtbl.find_opt live_diff_index (file_base, gi.gi_dh) with
+                | Some (found_sha, _) when found_sha = gi.gi_sha -> ()
                 | _ ->
                   Hashtbl.replace tbl edit_key None;
                   changed := true
               end else begin
                 let file_base = match String.split_on_char ':' edit_key with
                   | fb :: _ -> fb | [] -> "" in
-                match Hashtbl.find_opt live_diff_index (file_base, dh) with
+                match Hashtbl.find_opt live_diff_index (file_base, gi.gi_dh) with
                 | Some (new_sha, _) ->
-                  Hashtbl.replace tbl edit_key (Some (new_sha, dh));
+                  Hashtbl.replace tbl edit_key (Some { gi with gi_sha = new_sha });
                   changed := true;
                   incr n_relinked
                 | None ->
@@ -1381,8 +1393,8 @@ let update_git_links ~project_dir ~port ~collection_id mvar =
             | None -> ()
           ) tbl;
           if !changed then
-            Urme_search.Chromadb.update_interaction_git_info ~port ~collection_id
-              ~id ~git_info:(serialize_git_info tbl)
+            let+ _ok = Urme_search.Chromadb.update_interaction_git_info ~port ~collection_id
+              ~id ~git_info:(serialize_git_info tbl) in ()
           else Lwt.return_unit
         ) existing_gis in
         Lwt.return_unit
@@ -1532,7 +1544,7 @@ let update_git_links ~project_dir ~port ~collection_id mvar =
           Printf.sprintf "Git links: matching %d edits against %d/%d commits..."
             !n_edits n_relevant !n_commits }) in
     redraw mvar;
-    let gi_updates : (string, (string * (string * string) option) list) Hashtbl.t =
+    let gi_updates : (string, (string * git_info_val option) list) Hashtbl.t =
       Hashtbl.create 256 in
     let links : (string * string, git_conv_link list) Hashtbl.t = Hashtbl.create 256 in
     let* () = iter_workers ~n:16 (fun (sha, commit_ts, files) ->
@@ -1559,7 +1571,8 @@ let update_git_links ~project_dir ~port ~collection_id mvar =
               let existing = match Hashtbl.find_opt gi_updates iid with
                 | Some l -> l | None -> [] in
               Hashtbl.replace gi_updates iid
-                ((edit.edit_key, Some (sha, dh)) :: existing);
+                ((edit.edit_key, Some { gi_sha = sha; gi_dh = dh;
+                                        gi_ti = edit.turn_idx; gi_ei = edit.entry_idx }) :: existing);
               let link = { commit_sha = sha; file = file_base;
                            session_id = edit.session_id;
                            turn_idx = edit.turn_idx; entry_idx = edit.entry_idx;
@@ -1612,63 +1625,80 @@ let update_git_links ~project_dir ~port ~collection_id mvar =
       ) relevant_files
     ) relevant_commits in
 
-    (* === Phase 5 + 6 in parallel: persist + build in-memory links === *)
+    (* === Phase 5: persist to ChromaDB === *)
     let* () = update mvar (fun s ->
       { s with status_extra =
           Printf.sprintf "Git links: persisting %d updates..."
             (Hashtbl.length gi_updates) }) in
     redraw mvar;
 
-    let p_persist =
-      let update_list = Hashtbl.fold (fun iid entries acc ->
-        (iid, entries) :: acc) gi_updates [] in
-      iter_workers ~n:64 (fun (iid, entries) ->
-        let* existing_meta = Lwt.catch (fun () ->
-          Urme_search.Chromadb.get_interaction_meta ~port ~collection_id ~id:iid
-        ) (fun _ -> Lwt.return_none) in
-        let tbl = match existing_meta with
-          | Some meta ->
-            let open Yojson.Safe.Util in
-            let gi = meta |> member "git_info" |> to_string_option
-              |> Option.value ~default:"" in
-            parse_git_info gi
-          | None -> Hashtbl.create 8 in
-        List.iter (fun (ek, value) ->
-          Hashtbl.replace tbl ek value
-        ) entries;
-        Lwt.catch (fun () ->
-          Urme_search.Chromadb.update_interaction_git_info ~port ~collection_id
-            ~id:iid ~git_info:(serialize_git_info tbl)
-        ) (fun _ -> Lwt.return_unit)
-      ) update_list in
+    let update_list = Hashtbl.fold (fun iid entries acc ->
+      (iid, entries) :: acc) gi_updates [] in
+    let p5_ok = ref 0 in
+    let p5_miss = ref 0 in
+    let p5_err = ref 0 in
+    let* () = iter_workers ~n:8 (fun (iid, entries) ->
+      let* existing_meta = Lwt.catch (fun () ->
+        Urme_search.Chromadb.get_interaction_meta ~port ~collection_id ~id:iid
+      ) (fun exn ->
+        log_debug (Printf.sprintf "P5 get_meta err %s: %s" iid (Printexc.to_string exn));
+        Lwt.return_none) in
+      let tbl = match existing_meta with
+        | Some meta ->
+          let open Yojson.Safe.Util in
+          let gi = meta |> member "git_info" |> to_string_option
+            |> Option.value ~default:"" in
+          parse_git_info gi
+        | None ->
+          incr p5_miss;
+          log_debug (Printf.sprintf "P5 miss: %s not in ChromaDB" iid);
+          Hashtbl.create 8 in
+      List.iter (fun (ek, value) ->
+        Hashtbl.replace tbl ek value
+      ) entries;
+      Lwt.catch (fun () ->
+        let+ ok = Urme_search.Chromadb.update_interaction_git_info ~port ~collection_id
+          ~id:iid ~git_info:(serialize_git_info tbl) in
+        if ok then incr p5_ok
+        else begin
+          incr p5_miss;
+          log_debug (Printf.sprintf "P5 update_metadata returned false for %s" iid)
+        end
+      ) (fun exn ->
+        incr p5_err;
+        log_debug (Printf.sprintf "P5 update err %s: %s" iid (Printexc.to_string exn));
+        Lwt.return_unit)
+    ) update_list in
+    log_debug (Printf.sprintf "P5 done: %d ok, %d miss, %d err (of %d total)"
+      !p5_ok !p5_miss !p5_err (List.length update_list));
 
-    let p_merge_links =
-      List.iter (fun (_id, gi_str, session_id, _idx) ->
-        let tbl = parse_git_info gi_str in
-        Hashtbl.iter (fun ek value ->
-          match value with
-          | Some (commit_sha, _dh) ->
-            let file_base = match String.split_on_char ':' ek with
-              | fb :: _ -> fb | [] -> "" in
-            if file_base <> "" then begin
-              let lk = (commit_sha, file_base) in
-              let existing = match Hashtbl.find_opt links lk with
-                | Some l -> l | None -> [] in
-              if not (List.exists (fun (l : git_conv_link) -> l.edit_key = ek) existing) then begin
-                let link = { commit_sha; file = file_base;
-                             session_id; turn_idx = 0; entry_idx = 0;
-                             edit_key = ek } in
-                Hashtbl.replace links lk (existing @ [link])
-              end
+    (* === Phase 6: rebuild in-memory links from fresh ChromaDB data === *)
+    let* () = update mvar (fun s ->
+      { s with status_extra = "Git links: building link index..." }) in
+    redraw mvar;
+    let* fresh_gis =
+      Urme_search.Chromadb.get_all_with_git_info ~port ~collection_id in
+    List.iter (fun (_id, gi_str, session_id, _idx) ->
+      let tbl = parse_git_info gi_str in
+      Hashtbl.iter (fun ek value ->
+        match value with
+        | Some gi ->
+          let file_base = match String.split_on_char ':' ek with
+            | fb :: _ -> fb | [] -> "" in
+          if file_base <> "" then begin
+            let lk = (gi.gi_sha, file_base) in
+            let existing = match Hashtbl.find_opt links lk with
+              | Some l -> l | None -> [] in
+            if not (List.exists (fun (l : git_conv_link) -> l.edit_key = ek) existing) then begin
+              let link = { commit_sha = gi.gi_sha; file = file_base;
+                           session_id; turn_idx = gi.gi_ti; entry_idx = gi.gi_ei;
+                           edit_key = ek } in
+              Hashtbl.replace links lk (existing @ [link])
             end
-          | None -> ()
-        ) tbl
-      ) existing_gis;
-      Lwt.return_unit
-    in
-
-    let* () = p_persist
-    and* () = p_merge_links in
+          end
+        | None -> ()
+      ) tbl
+    ) fresh_gis;
 
     Lwt.return (links, !n_edits, !n_matched, !n_commits, !n_relinked)
   ) (fun exn ->
@@ -1717,26 +1747,65 @@ let load_git_data ~cwd =
                file_diff_filter = None; git_links = Hashtbl.create 0;
                link_candidates = [] }, debug)
 
-let log_debug msg =
-  let oc = open_out_gen [Open_append; Open_creat] 0o644 "/tmp/urme_debug.log" in
-  Printf.fprintf oc "[%s] %s\n" (string_of_float (Unix.gettimeofday ())) msg;
-  close_out oc
+(* Rebuild in-memory git_links from ChromaDB's git_info metadata *)
+let load_git_links_from_chroma ~port ~project =
+  Lwt.catch (fun () ->
+    let* collection_id =
+      Urme_search.Chromadb.ensure_interactions_collection ~port ~project in
+    let* existing_gis =
+      Urme_search.Chromadb.get_all_with_git_info ~port ~collection_id in
+    log_debug (Printf.sprintf "cold_start: %d entries with git_info" (List.length existing_gis));
+    let links : (string * string, git_conv_link list) Hashtbl.t =
+      Hashtbl.create 256 in
+    List.iter (fun (id, gi_str, session_id, _idx) ->
+      log_debug (Printf.sprintf "cold_start entry: id=%s session=%s gi=%s"
+        id session_id (String.sub gi_str 0 (min 100 (String.length gi_str))));
+      let tbl = parse_git_info gi_str in
+      Hashtbl.iter (fun ek value ->
+        match value with
+        | Some gi ->
+          let file_base = match String.split_on_char ':' ek with
+            | fb :: _ -> fb | [] -> "" in
+          if file_base <> "" then begin
+            let lk = (gi.gi_sha, file_base) in
+            let existing = match Hashtbl.find_opt links lk with
+              | Some l -> l | None -> [] in
+            if not (List.exists (fun (l : git_conv_link) -> l.edit_key = ek) existing) then begin
+              let link = { commit_sha = gi.gi_sha; file = file_base;
+                           session_id; turn_idx = gi.gi_ti; entry_idx = gi.gi_ei;
+                           edit_key = ek } in
+              Hashtbl.replace links lk (existing @ [link])
+            end
+          end
+        | None -> ()
+      ) tbl
+    ) existing_gis;
+    Lwt.return links
+  ) (fun _ -> Lwt.return (Hashtbl.create 0))
 
 let switch_to_git mvar =
-  log_debug "switch_to_git: taking mvar...";
   let* s = Lwt_mvar.take mvar in
-  log_debug (Printf.sprintf "switch_to_git: got mvar, project_dir=%s" s.project_dir);
   let* () = Lwt_mvar.put mvar { s with status_extra = "Loading git data..." } in
   redraw mvar;
-  log_debug "switch_to_git: taking mvar again...";
   let* s = Lwt_mvar.take mvar in
-  log_debug "switch_to_git: loading git data...";
   let* (git, debug) = load_git_data ~cwd:s.project_dir in
-  log_debug (Printf.sprintf "switch_to_git: %s" debug);
-  let git = { git with git_links = s.git.git_links } in
+  (* If in-memory git_links are empty, rebuild from ChromaDB *)
+  let* git_links =
+    if Hashtbl.length s.git.git_links > 0 then
+      Lwt.return s.git.git_links
+    else begin
+      let* () = Lwt_mvar.put mvar { s with status_extra = "Loading git links..." } in
+      redraw mvar;
+      let* links = load_git_links_from_chroma
+          ~port:s.config.chromadb_port
+          ~project:(Filename.basename s.project_dir) in
+      let* s = Lwt_mvar.take mvar in
+      ignore s; Lwt.return links
+    end in
+  let git = { git with git_links } in
   let status = if git.branches = [] then
     Printf.sprintf "Git: no branches! %s" debug
-  else "Git browser" in
+  else Printf.sprintf "Git browser (%d link keys)" (Hashtbl.length git_links) in
   let* () = Lwt_mvar.put mvar { s with mode = Git; git; status_extra = status } in
   redraw mvar; Lwt.return_unit
 
@@ -1758,7 +1827,7 @@ let check_ollama url =
   ) (fun _ -> Lwt.return false)
 
 (* Start services if not running, wait for them to be ready.
-   Returns (started_chroma, started_ollama) so we can kill them on exit. *)
+   Starts services if not already running. *)
 let ensure_services mvar ~chromadb_port ~ollama_url ~project_dir =
   let* chroma_ok = check_port chromadb_port in
   let* did_start_chroma = if not chroma_ok then begin
@@ -1910,8 +1979,7 @@ let index_sessions mvar =
               redraw mvar; Lwt.return_unit
             end else Lwt.return_unit in
           iteri_workers ~n:8 (fun i (interaction : Urme_core.Types.interaction) ->
-            if String.length interaction.user_text < 5 then Lwt.return_unit
-            else begin
+            begin
               let id = Printf.sprintf "%s_%d" session_id i in
               let* existing = Lwt.catch (fun () ->
                 Urme_search.Chromadb.get_interaction_meta ~port ~collection_id ~id
@@ -1955,6 +2023,23 @@ let index_sessions mvar =
       let* (git_links, gl_edits, gl_matched, gl_commits, gl_relinked) =
         update_git_links ~project_dir:cwd ~port ~collection_id mvar in
       let n_links = Hashtbl.length git_links in
+      (* Flush: restart ChromaDB so SQLite WAL checkpoints to disk *)
+      let* () = update mvar (fun s ->
+        { s with status_extra = "Flushing ChromaDB..." }) in
+      redraw mvar;
+      ignore (Sys.command "pkill -TERM -f 'chroma run' 2>/dev/null");
+      let rec wait_exit n =
+        if n <= 0 then Lwt.return_unit
+        else
+          let alive = Sys.command "pgrep -f 'chroma run' >/dev/null 2>&1" = 0 in
+          if alive then
+            let* () = Lwt_unix.sleep 0.2 in wait_exit (n - 1)
+          else Lwt.return_unit
+      in
+      let* () = wait_exit 25 in
+      let* () = ensure_services mvar ~chromadb_port:port
+          ~ollama_url:(match peek mvar with
+            | Some s -> s.config.ollama_url | None -> "") ~project_dir:cwd in
       let* () = update mvar (fun s ->
         { s with git = { s.git with git_links };
                  status_extra =
@@ -2471,13 +2556,18 @@ let run ~config ~project_dir () =
     let s = match peek mvar with Some s -> s | None -> initial_state ~config ~project_dir in
     (match s.daemon with Some d -> Urme_claude.Process.kill d | None -> ());
     (match s.perm_server with
-     | Some ps -> Lwt.async (fun () -> Permission_server.stop ps) | None -> ());
-    (* Kill services we started *)
+     | Some ps ->
+       Lwt.catch (fun () -> Permission_server.stop ps) (fun _ -> Lwt.return_unit)
+       |> Lwt.ignore_result
+     | None -> ());
+    (* Gracefully stop services we started *)
     if s.started_chroma then
-      ignore (Sys.command "pkill -f 'chroma run' 2>/dev/null");
+      ignore (Sys.command "pkill -TERM -f 'chroma run' 2>/dev/null");
     if s.started_ollama then
-      ignore (Sys.command "pkill -x ollama 2>/dev/null");
-    LTerm_ui.quit ui
+      ignore (Sys.command "pkill -TERM -x ollama 2>/dev/null");
+    (* Quit UI, then hard-exit to skip at_exit handlers that hit stale FDs *)
+    (try Lwt.ignore_result (LTerm_ui.quit ui) with _ -> ());
+    Unix._exit 0
   in
 
   let rec loop () =
