@@ -1323,56 +1323,70 @@ let update_git_links ~project_dir ~port ~collection_id mvar =
       { s with status_extra = "Git links: stale refs + JSONL scan..." }) in
     redraw mvar;
 
-    (* Phase 2: Re-link or wipe stale references *)
+    (* Shared diff-hash cache: (sha, file) → diff_hash *)
+    let diff_hash_cache : (string * string, string) Hashtbl.t = Hashtbl.create 256 in
+    let get_diff_hash sha file =
+      match Hashtbl.find_opt diff_hash_cache (sha, file) with
+      | Some dh -> Lwt.return dh
+      | None ->
+        let* diff = Lwt.catch (fun () ->
+          Urme_git.Ops.run_git ~cwd ["diff"; sha ^ "^"; sha; "--"; file]
+        ) (fun _ -> Lwt.return "") in
+        let dh = diff_hash_of_string diff in
+        Hashtbl.replace diff_hash_cache (sha, file) dh;
+        Lwt.return dh
+    in
+
+    (* Phase 2: Re-link or wipe stale references — skip if nothing to relink *)
     let p_phase2 =
-      let live_diff_index : (string * string, string * string) Hashtbl.t = Hashtbl.create 256 in
-      let* () = iter_workers ~n:16 (fun (sha, _ts, files) ->
-        iter_workers ~n:8 (fun file ->
+      if existing_gis = [] then Lwt.return_unit
+      else begin
+        let live_diff_index : (string * string, string * string) Hashtbl.t = Hashtbl.create 256 in
+        let diff_tasks = List.concat_map (fun (sha, _ts, files) ->
+          List.map (fun file -> (sha, file)) files
+        ) commits_with_files in
+        let* () = iter_workers ~n:32 (fun (sha, file) ->
           let file_base = Filename.basename file in
-          let* diff = Lwt.catch (fun () ->
-            Urme_git.Ops.run_git ~cwd ["diff"; sha ^ "^"; sha; "--"; file]
-          ) (fun _ -> Lwt.return "") in
-          if diff <> "" then begin
-            let dh = diff_hash_of_string diff in
-            Hashtbl.replace live_diff_index (file_base, dh) (sha, file)
-          end;
+          let* dh = get_diff_hash sha file in
+          if dh <> (diff_hash_of_string "") then
+            Hashtbl.replace live_diff_index (file_base, dh) (sha, file);
           Lwt.return_unit
-        ) files
-      ) commits_with_files in
-      let* () = iter_workers ~n:64 (fun (id, gi_str, _session_id, _idx) ->
-        let tbl = parse_git_info gi_str in
-        let changed = ref false in
-        Hashtbl.iter (fun edit_key value ->
-          match value with
-          | Some (commit_sha, dh) ->
-            if Hashtbl.mem live_shas commit_sha then begin
-              let file_base = match String.split_on_char ':' edit_key with
-                | fb :: _ -> fb | [] -> "" in
-              match Hashtbl.find_opt live_diff_index (file_base, dh) with
-              | Some (found_sha, _) when found_sha = commit_sha -> ()
-              | _ ->
-                Hashtbl.replace tbl edit_key None;
-                changed := true
-            end else begin
-              let file_base = match String.split_on_char ':' edit_key with
-                | fb :: _ -> fb | [] -> "" in
-              match Hashtbl.find_opt live_diff_index (file_base, dh) with
-              | Some (new_sha, _) ->
-                Hashtbl.replace tbl edit_key (Some (new_sha, dh));
-                changed := true;
-                incr n_relinked
-              | None ->
-                Hashtbl.replace tbl edit_key None;
-                changed := true
-            end
-          | None -> ()
-        ) tbl;
-        if !changed then
-          Urme_search.Chromadb.update_interaction_git_info ~port ~collection_id
-            ~id ~git_info:(serialize_git_info tbl)
-        else Lwt.return_unit
-      ) existing_gis in
-      Lwt.return_unit
+        ) diff_tasks in
+        let* () = iter_workers ~n:16 (fun (id, gi_str, _session_id, _idx) ->
+          let tbl = parse_git_info gi_str in
+          let changed = ref false in
+          Hashtbl.iter (fun edit_key value ->
+            match value with
+            | Some (commit_sha, dh) ->
+              if Hashtbl.mem live_shas commit_sha then begin
+                let file_base = match String.split_on_char ':' edit_key with
+                  | fb :: _ -> fb | [] -> "" in
+                match Hashtbl.find_opt live_diff_index (file_base, dh) with
+                | Some (found_sha, _) when found_sha = commit_sha -> ()
+                | _ ->
+                  Hashtbl.replace tbl edit_key None;
+                  changed := true
+              end else begin
+                let file_base = match String.split_on_char ':' edit_key with
+                  | fb :: _ -> fb | [] -> "" in
+                match Hashtbl.find_opt live_diff_index (file_base, dh) with
+                | Some (new_sha, _) ->
+                  Hashtbl.replace tbl edit_key (Some (new_sha, dh));
+                  changed := true;
+                  incr n_relinked
+                | None ->
+                  Hashtbl.replace tbl edit_key None;
+                  changed := true
+              end
+            | None -> ()
+          ) tbl;
+          if !changed then
+            Urme_search.Chromadb.update_interaction_git_info ~port ~collection_id
+              ~id ~git_info:(serialize_git_info tbl)
+          else Lwt.return_unit
+        ) existing_gis in
+        Lwt.return_unit
+      end
     in
 
     (* Phase 3: Build edit index from JSONL — parallel per session via Domain *)
@@ -1499,100 +1513,104 @@ let update_git_links ~project_dir ~port ~collection_id mvar =
     and* sorted_edits = p_phase3 in
 
     (* === Phase 4: Commit-centric matching === *)
+    (* Build file_base → edits index for O(1) lookup *)
+    let edit_index = Hashtbl.create 256 in
+    List.iter (fun e ->
+      let existing = match Hashtbl.find_opt edit_index e.file_base with
+        | Some l -> l | None -> [] in
+      Hashtbl.replace edit_index e.file_base (e :: existing)
+    ) sorted_edits;
+    let edit_file_bases = Hashtbl.create (Hashtbl.length edit_index) in
+    Hashtbl.iter (fun fb _ -> Hashtbl.replace edit_file_bases fb ()) edit_index;
+    (* Filter commits to only those touching files we have edits for *)
+    let relevant_commits = List.filter (fun (_sha, _ts, files) ->
+      List.exists (fun f -> Hashtbl.mem edit_file_bases (Filename.basename f)) files
+    ) commits_with_files in
+    let n_relevant = List.length relevant_commits in
     let* () = update mvar (fun s ->
       { s with status_extra =
-          Printf.sprintf "Git links: matching %d edits against %d commits..."
-            !n_edits !n_commits }) in
+          Printf.sprintf "Git links: matching %d edits against %d/%d commits..."
+            !n_edits n_relevant !n_commits }) in
     redraw mvar;
     let gi_updates : (string, (string * (string * string) option) list) Hashtbl.t =
       Hashtbl.create 256 in
     let links : (string * string, git_conv_link list) Hashtbl.t = Hashtbl.create 256 in
     let* () = iter_workers ~n:16 (fun (sha, commit_ts, files) ->
-      let* parent_shas = Lwt.catch (fun () ->
-        let+ (_msg, _author, _date, parents) =
-          Urme_store.Project_store.commit_info ~repo ~sha in
-        parents
-      ) (fun _ -> Lwt.return []) in
-      let parent_sha = match parent_shas with p :: _ -> p | [] -> "" in
-      iter_workers ~n:8 (fun file ->
+      let relevant_files = List.filter (fun f ->
+        Hashtbl.mem edit_file_bases (Filename.basename f)) files in
+      Lwt_list.iter_s (fun file ->
         let file_base = Filename.basename file in
-        let* file_after = Lwt.catch (fun () ->
-          Urme_store.Project_store.read_blob ~repo ~sha ~path:file
-        ) (fun _ -> Lwt.return_none) in
-        let* file_before = if parent_sha <> "" then
-          Lwt.catch (fun () ->
-            Urme_store.Project_store.read_blob ~repo ~sha:parent_sha ~path:file
-          ) (fun _ -> Lwt.return_none)
-        else Lwt.return_none in
-        match file_after with
-        | None -> Lwt.return_unit
-        | Some content_after ->
-          let* raw_diff = Lwt.catch (fun () ->
-            Urme_git.Ops.run_git ~cwd ["diff"; sha ^ "^"; sha; "--"; file]
-          ) (fun _ -> Lwt.return "") in
-          let dh = diff_hash_of_string raw_diff in
-          let candidates = List.filter (fun e ->
-            e.file_base = file_base && e.timestamp < commit_ts
-          ) sorted_edits in
-          let current_content = ref content_after in
-          let record_match edit =
-            incr n_matched;
-            let iid = Printf.sprintf "%s_%d" edit.session_id edit.interaction_index in
-            let existing = match Hashtbl.find_opt gi_updates iid with
-              | Some l -> l | None -> [] in
-            Hashtbl.replace gi_updates iid
-              ((edit.edit_key, Some (sha, dh)) :: existing);
-            let link = { commit_sha = sha; file = file_base;
-                         session_id = edit.session_id;
-                         turn_idx = edit.turn_idx; entry_idx = edit.entry_idx;
-                         edit_key = edit.edit_key } in
-            let lk = (sha, file_base) in
-            let el = match Hashtbl.find_opt links lk with
-              | Some l -> l | None -> [] in
-            Hashtbl.replace links lk (el @ [link])
-          in
-          List.iter (fun edit ->
-            if edit.old_string <> "" then begin
-              let cc = !current_content in
-              let pos = string_find_pos edit.new_string cc in
-              if pos >= 0 then begin
-                let ns_len = String.length edit.new_string in
-                let cc_len = String.length cc in
-                let undone = String.sub cc 0 pos ^ edit.old_string ^
-                             String.sub cc (pos + ns_len) (cc_len - pos - ns_len) in
-                let fname = file_base in
-                (match Patch.diff (Some (fname, cc)) (Some (fname, undone)) with
-                 | Some reverse_patch ->
-                   let result = try
-                     Patch.patch ~cleanly:true (Some cc) reverse_patch
-                   with _ -> None in
-                   (match result with
-                    | Some new_cc ->
-                      current_content := new_cc;
-                      record_match edit
-                    | None ->
-                      current_content := undone;
-                      record_match edit)
-                 | None ->
-                   current_content := undone;
-                   record_match edit)
-              end
-            end else if edit.new_string <> "" then begin
-              let ns = edit.new_string in
-              let cc = !current_content in
-              let check_len = min (String.length ns) (String.length cc) in
-              if check_len > 20 then begin
-                let sample = String.sub ns 0 (min 100 (String.length ns)) in
-                if string_find_pos sample cc >= 0 then begin
-                  record_match edit
+        let candidates = match Hashtbl.find_opt edit_index file_base with
+          | Some edits -> List.filter (fun e -> e.timestamp < commit_ts) edits
+          | None -> [] in
+        if candidates = [] then Lwt.return_unit
+        else begin
+          let* file_after = Lwt.catch (fun () ->
+            Urme_store.Project_store.read_blob ~repo ~sha ~path:file
+          ) (fun _ -> Lwt.return_none) in
+          match file_after with
+          | None -> Lwt.return_unit
+          | Some content_after ->
+            let* dh = get_diff_hash sha file in
+            let current_content = ref content_after in
+            let record_match edit =
+              incr n_matched;
+              let iid = Printf.sprintf "%s_%d" edit.session_id edit.interaction_index in
+              let existing = match Hashtbl.find_opt gi_updates iid with
+                | Some l -> l | None -> [] in
+              Hashtbl.replace gi_updates iid
+                ((edit.edit_key, Some (sha, dh)) :: existing);
+              let link = { commit_sha = sha; file = file_base;
+                           session_id = edit.session_id;
+                           turn_idx = edit.turn_idx; entry_idx = edit.entry_idx;
+                           edit_key = edit.edit_key } in
+              let lk = (sha, file_base) in
+              let el = match Hashtbl.find_opt links lk with
+                | Some l -> l | None -> [] in
+              Hashtbl.replace links lk (el @ [link])
+            in
+            List.iter (fun edit ->
+              if edit.old_string <> "" then begin
+                let cc = !current_content in
+                let pos = string_find_pos edit.new_string cc in
+                if pos >= 0 then begin
+                  let ns_len = String.length edit.new_string in
+                  let cc_len = String.length cc in
+                  let undone = String.sub cc 0 pos ^ edit.old_string ^
+                               String.sub cc (pos + ns_len) (cc_len - pos - ns_len) in
+                  let fname = file_base in
+                  (match Patch.diff (Some (fname, cc)) (Some (fname, undone)) with
+                   | Some reverse_patch ->
+                     let result = try
+                       Patch.patch ~cleanly:true (Some cc) reverse_patch
+                     with _ -> None in
+                     (match result with
+                      | Some new_cc ->
+                        current_content := new_cc;
+                        record_match edit
+                      | None ->
+                        current_content := undone;
+                        record_match edit)
+                   | None ->
+                     current_content := undone;
+                     record_match edit)
+                end
+              end else if edit.new_string <> "" then begin
+                let ns = edit.new_string in
+                let cc = !current_content in
+                let check_len = min (String.length ns) (String.length cc) in
+                if check_len > 20 then begin
+                  let sample = String.sub ns 0 (min 100 (String.length ns)) in
+                  if string_find_pos sample cc >= 0 then begin
+                    record_match edit
+                  end
                 end
               end
-            end
-          ) candidates;
-          ignore file_before;
-          Lwt.return_unit
-      ) files
-    ) commits_with_files in
+            ) candidates;
+            Lwt.return_unit
+        end
+      ) relevant_files
+    ) relevant_commits in
 
     (* === Phase 5 + 6 in parallel: persist + build in-memory links === *)
     let* () = update mvar (fun s ->
