@@ -447,7 +447,9 @@ let get_all_with_git_info ~port ~collection_id =
           |> Option.value ~default:"" in
         let idx = meta |> member "interaction_index" |> to_int_option
           |> Option.value ~default:0 in
-        Some (id, gi, session_id, idx)
+        let ts = meta |> member "timestamp" |> to_string_option
+          |> Option.value ~default:"" in
+        Some (id, gi, session_id, idx, ts)
       else None
     ) (List.combine ids metadatas) in
     let acc = acc @ found in
@@ -455,6 +457,24 @@ let get_all_with_git_info ~port ~collection_id =
       Lwt.return acc
     else
       fetch_page ~offset:(offset + 500) ~acc
+  in
+  fetch_page ~offset:0 ~acc:[]
+
+(* Fetch all interaction IDs in the collection (paged). *)
+let get_all_interaction_ids ~port ~collection_id =
+  let rec fetch_page ~offset ~acc =
+    let body = `Assoc [
+      "include", `List [];
+      "limit", `Int 5000;
+      "offset", `Int offset;
+    ] in
+    let* resp = http_post ~port
+      ~path:(Printf.sprintf "/collections/%s/get" collection_id) ~body in
+    let open Yojson.Safe.Util in
+    let ids = resp |> member "ids" |> safe_to_list |> List.map to_string in
+    let acc = acc @ ids in
+    if List.length ids < 5000 then Lwt.return acc
+    else fetch_page ~offset:(offset + 5000) ~acc
   in
   fetch_page ~offset:0 ~acc:[]
 
