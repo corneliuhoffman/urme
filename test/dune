@@ -1,0 +1,4 @@
+(executable
+ (name test_engine)
+ (libraries urme_engine urme_core urme_store urme_git urme_search
+            lwt lwt.unix domainslib yojson str))

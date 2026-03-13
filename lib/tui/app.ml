@@ -88,14 +88,7 @@ type conv_entry =
 
 type git_focus = Branches | Commits | Files | Links
 
-type git_conv_link = {
-  commit_sha : string;
-  file : string;          (* basename *)
-  session_id : string;
-  turn_idx : int;         (* which turn in the session *)
-  entry_idx : int;        (* which conv_entry within the turn *)
-  edit_key : string;      (* file_base:Digest(new_string) — unique edit identifier *)
-}
+type git_conv_link = Urme_engine.Git_link_types.link
 
 type git_state = {
   branches : string list;
@@ -733,12 +726,39 @@ let render_entry ~width ~verbose entry =
           List.filteri (fun i _ -> i < 30) lines @
           [Printf.sprintf "... (%d more lines)" (List.length lines - 30)]
         else lines in
+        let parse_hunk line =
+          (* Parse @@ -old_start,old_len +new_start,new_len @@ *)
+          try Scanf.sscanf line "@@ -%d,%d +%d,%d @@%_s"
+                (fun o _ n _ -> Some (o, n))
+          with _ ->
+            try Scanf.sscanf line "@@ -%d +%d,%d @@%_s"
+                  (fun o n _ -> Some (o, n))
+            with _ ->
+              try Scanf.sscanf line "@@ -%d,%d +%d @@%_s"
+                    (fun o _ n -> Some (o, n))
+              with _ -> None
+        in
+        let old_ln = ref 0 in
+        let new_ln = ref 0 in
         List.map (fun line ->
           if String.length line > 0 then match line.[0] with
-            | '+' -> mk ~bg:(Some c_diff_add_bg) c_diff_add_fg ("    " ^ line)
-            | '-' -> mk ~bg:(Some c_diff_del_bg) c_diff_del_fg ("    " ^ line)
-            | '@' -> mk c_tool_name ("    " ^ line)
-            | _ -> mk c_fg ("    " ^ line)
+            | '@' ->
+              (match parse_hunk line with
+               | Some (o, n) -> old_ln := o; new_ln := n
+               | None -> ());
+              mk c_tool_name ("    " ^ line)
+            | '+' ->
+              let prefix = Printf.sprintf "    %4d " !new_ln in
+              new_ln := !new_ln + 1;
+              mk ~bg:(Some c_diff_add_bg) c_diff_add_fg (prefix ^ line)
+            | '-' ->
+              let prefix = Printf.sprintf " %4d    " !old_ln in
+              old_ln := !old_ln + 1;
+              mk ~bg:(Some c_diff_del_bg) c_diff_del_fg (prefix ^ line)
+            | _ ->
+              let prefix = Printf.sprintf " %4d %4d " !old_ln !new_ln in
+              old_ln := !old_ln + 1; new_ln := !new_ln + 1;
+              mk c_fg (prefix ^ line)
           else mk c_fg ""
         ) lines
     in
@@ -982,23 +1002,50 @@ let draw_git_diff ctx state =
       ) lines;
       String.concat "\n" (List.rev !result) in
   let lines = String.split_on_char '\n' diff_text in
+  let parse_hunk line =
+    try Scanf.sscanf line "@@ -%d,%d +%d,%d @@%_s"
+          (fun o _ n _ -> Some (o, n))
+    with _ ->
+      try Scanf.sscanf line "@@ -%d +%d,%d @@%_s"
+            (fun o n _ -> Some (o, n))
+      with _ ->
+        try Scanf.sscanf line "@@ -%d,%d +%d @@%_s"
+              (fun o _ n -> Some (o, n))
+        with _ -> None
+  in
+  let old_ln = ref 0 in
+  let new_ln = ref 0 in
+  let numbered = List.map (fun line ->
+    if String.length line > 0 then match line.[0] with
+      | '@' ->
+        (match parse_hunk line with
+         | Some (o, n) -> old_ln := o; new_ln := n
+         | None -> ());
+        (line, LTerm_style.cyan, c_bg)
+      | '+' ->
+        let prefix = Printf.sprintf "%4d " !new_ln in
+        new_ln := !new_ln + 1;
+        (prefix ^ line, c_diff_add_fg, c_diff_add_bg)
+      | '-' ->
+        let prefix = Printf.sprintf "%4d " !old_ln in
+        old_ln := !old_ln + 1;
+        (prefix ^ line, c_diff_del_fg, c_diff_del_bg)
+      | _ ->
+        let prefix = Printf.sprintf "%4d " !new_ln in
+        old_ln := !old_ln + 1; new_ln := !new_ln + 1;
+        (prefix ^ line, c_fg, c_bg)
+    else ("", c_fg, c_bg)
+  ) lines in
   let vh = max 0 (size.rows - 1) in
   let scroll = g.diff_scroll_git in
-  let visible_lines = List.filteri (fun i _ -> i >= scroll && i < scroll + vh) lines in
-  List.iteri (fun vi line ->
+  let visible = List.filteri (fun i _ -> i >= scroll && i < scroll + vh) numbered in
+  List.iteri (fun vi (text, fg, bg) ->
     let row = 1 + vi in
-    if row < size.rows then begin
-      let fg, bg = if String.length line > 0 then match line.[0] with
-        | '+' -> (c_diff_add_fg, c_diff_add_bg)
-        | '-' -> (c_diff_del_fg, c_diff_del_bg)
-        | '@' -> (LTerm_style.cyan, c_bg)
-        | _ -> (c_fg, c_bg)
-      else (c_fg, c_bg) in
+    if row < size.rows then
       draw_str ctx row 1
         ~style:LTerm_style.{ none with background = Some bg; foreground = Some fg }
-        line
-    end
-  ) visible_lines
+        text
+  ) visible
 
 (* ---------- History mode drawing ---------- *)
 
@@ -1269,561 +1316,20 @@ let ensure_daemon mvar =
 
 (* ---------- Commit-centric git ↔ conversation link index ---------- *)
 
-(* Edit record extracted from JSONL for matching against commits *)
-type pending_edit = {
-  edit_key : string;       (* file_base:Digest(new_string) *)
-  file_base : string;
-  new_string : string;     (* raw new_string from Edit, or content from Write *)
-  old_string : string;     (* raw old_string from Edit, empty for Write *)
-  timestamp : float;
-  session_id : string;
-  interaction_index : int;
-  turn_idx : int;
-  entry_idx : int;
-}
-
-(* Compute edit_key = file_base:hex_digest(new_string) *)
-let make_edit_key ~file_base ~new_string =
-  let hash = Digest.string new_string |> Digest.to_hex in
-  Printf.sprintf "%s:%s" file_base hash
-
-(* Compute diff_hash = hex digest of a raw diff string *)
-let diff_hash_of_string s = Digest.string s |> Digest.to_hex
-
-(* git_info value: (commit_sha, diff_hash, turn_idx, entry_idx) *)
-type git_info_val = { gi_sha : string; gi_dh : string; gi_ti : int; gi_ei : int }
-
-(* Parse git_info JSON string into a map: edit_key → option git_info_val
-   Backwards-compatible: [sha, dh] → ti=0 ei=0; [sha, dh, ti, ei] → full *)
-let parse_git_info s =
-  if s = "" then Hashtbl.create 0
-  else
-    let tbl = Hashtbl.create 16 in
-    (try
-      let json = Yojson.Safe.from_string s in
-      (match json with
-       | `Assoc pairs ->
-         List.iter (fun (key, value) ->
-           match value with
-           | `List [`String sha; `String dh; `Int ti; `Int ei] ->
-             Hashtbl.replace tbl key (Some { gi_sha = sha; gi_dh = dh; gi_ti = ti; gi_ei = ei })
-           | `List [`String sha; `String dh] ->
-             Hashtbl.replace tbl key (Some { gi_sha = sha; gi_dh = dh; gi_ti = 0; gi_ei = 0 })
-           | `Null -> Hashtbl.replace tbl key None
-           | _ -> ()
-         ) pairs
-       | _ -> ())
-    with _ -> ());
-    tbl
-
-(* Serialize git_info map back to JSON string *)
-let serialize_git_info tbl =
-  let pairs = Hashtbl.fold (fun key value acc ->
-    let v = match value with
-      | Some gi -> `List [`String gi.gi_sha; `String gi.gi_dh; `Int gi.gi_ti; `Int gi.gi_ei]
-      | None -> `Null in
-    (key, v) :: acc
-  ) tbl [] in
-  Yojson.Safe.to_string (`Assoc pairs)
-
-(* Check if all entries in git_info are non-null (complete) *)
-let git_info_is_complete tbl =
-  Hashtbl.length tbl > 0 &&
-  Hashtbl.fold (fun _k v acc -> acc && v <> None) tbl true
-
-(* Find first occurrence of needle in haystack, return position or -1 *)
-let string_find_pos needle haystack =
-  let nl = String.length needle in
-  let hl = String.length haystack in
-  if nl = 0 then 0
-  else if nl > hl then -1
-  else
-    let rec search i =
-      if i > hl - nl then -1
-      else if String.sub haystack i nl = needle then i
-      else search (i + 1)
-    in
-    search 0
-
 let log_debug msg =
   let oc = open_out_gen [Open_append; Open_creat] 0o644 "/tmp/urme_debug.log" in
   Printf.fprintf oc "[%s] %s\n" (string_of_float (Unix.gettimeofday ())) msg;
   close_out oc
 
-(* update_git_links: the main 6-phase algorithm *)
+let parse_git_info = Urme_engine.Git_link_types.parse_git_info_json
+
+(* update_git_links: delegate to Git_link engine module *)
 let update_git_links ~project_dir ~port ~collection_id ?(sessions_filter : string list option) mvar =
-  let cwd = project_dir in
-  let n_edits = ref 0 in
-  let n_matched = ref 0 in
-  let matched_unique : (string, unit) Hashtbl.t = Hashtbl.create 256 in
-  let n_commits = ref 0 in
-  let n_relinked = ref 0 in
-  Lwt.catch (fun () ->
-    (* === Phase 1: Collect current git state (parallel fetches) === *)
-    let* () = update mvar (fun s ->
-      { s with status_extra = "Git links: collecting git state..." }) in
-    redraw mvar;
-    (* Find the oldest session timestamp to bound git log *)
-    let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir ~project_dir in
-    let all_sessions_for_ts = Urme_search.Jsonl_reader.list_sessions ~jsonl_dir in
-    let oldest_session_ts = match List.rev all_sessions_for_ts with
-      | last :: _ -> Urme_search.Jsonl_reader.first_line_timestamp last
-      | [] -> "" in
-    let since_flag = if oldest_session_ts <> "" then ["--since"; oldest_session_ts] else [] in
-    let* user_email =
-      Lwt.catch (fun () ->
-        let+ e = Urme_git.Ops.run_git ~cwd ["config"; "user.email"] in
-        String.trim e
-      ) (fun _ -> Lwt.return "") in
-    let author_flag = if user_email <> "" then ["--author"; user_email] else [] in
-    let log_flags = since_flag @ author_flag in
-    let p_commits = Lwt.catch
-      (fun () -> Urme_git.Ops.walk_log ~cwd ~max_count:5000 ~all:true ())
-      (fun _ -> Lwt.return []) in
-    let p_repo = Urme_store.Project_store.open_repo ~project_dir in
-    let p_log = Lwt.catch (fun () ->
-      Urme_git.Ops.run_git ~cwd
-        (["log"; "--all"; "--format=COMMIT %H %at"; "--name-only"] @ log_flags)
-    ) (fun _ -> Lwt.return "") in
-    let p_existing_gis = Lwt.catch (fun () ->
-      Urme_search.Chromadb.get_all_with_git_info ~port ~collection_id
-    ) (fun _ -> Lwt.return []) in
-    let* all_commits = p_commits
-    and* repo = p_repo
-    and* log_output = p_log
-    and* existing_gis = p_existing_gis in
-    n_commits := List.length all_commits;
-    let live_shas = Hashtbl.create (List.length all_commits) in
-    List.iter (fun (sha, _ts, _msg) -> Hashtbl.replace live_shas sha ()) all_commits;
-    let commits_with_files = ref [] in
-    let cur_sha = ref "" in
-    let cur_ts = ref 0.0 in
-    let cur_files = ref [] in
-    let flush () =
-      if !cur_sha <> "" then
-        commits_with_files := (!cur_sha, !cur_ts, List.rev !cur_files) :: !commits_with_files;
-      cur_sha := ""; cur_ts := 0.0; cur_files := [] in
-    String.split_on_char '\n' log_output |> List.iter (fun line ->
-      if String.length line > 7 && String.sub line 0 7 = "COMMIT " then begin
-        flush ();
-        let rest = String.sub line 7 (String.length line - 7) in
-        match String.split_on_char ' ' rest with
-        | sha :: ts_str :: _ ->
-          cur_sha := sha;
-          cur_ts := (try float_of_string ts_str with _ -> 0.0)
-        | _ -> ()
-      end else if String.length line > 0 then
-        cur_files := line :: !cur_files
-    );
-    flush ();
-    let commits_with_files = List.rev !commits_with_files in
-
-    (* === Phase 2 + 3 in parallel === *)
-    let* () = update mvar (fun s ->
-      { s with status_extra = "Git links: stale refs + JSONL scan..." }) in
-    redraw mvar;
-
-    (* Shared diff-hash cache: (sha, file) → diff_hash *)
-    let diff_hash_cache : (string * string, string) Hashtbl.t = Hashtbl.create 256 in
-    let get_diff_hash sha file =
-      match Hashtbl.find_opt diff_hash_cache (sha, file) with
-      | Some dh -> Lwt.return dh
-      | None ->
-        let* diff = Lwt.catch (fun () ->
-          Urme_git.Ops.run_git ~cwd ["diff"; sha ^ "^"; sha; "--"; file]
-        ) (fun _ -> Lwt.return "") in
-        let dh = diff_hash_of_string diff in
-        Hashtbl.replace diff_hash_cache (sha, file) dh;
-        Lwt.return dh
-    in
-
-    (* Phase 2: Re-link or wipe stale references — skip if nothing to relink *)
-    let p_phase2 =
-      if existing_gis = [] then Lwt.return_unit
-      else begin
-        let live_diff_index : (string * string, string * string) Hashtbl.t = Hashtbl.create 256 in
-        let diff_tasks = List.concat_map (fun (sha, _ts, files) ->
-          List.map (fun file -> (sha, file)) files
-        ) commits_with_files in
-        let* () = iter_workers ~n:(ncpu * 4) (fun (sha, file) ->
-          let file_base = Filename.basename file in
-          let* dh = get_diff_hash sha file in
-          if dh <> (diff_hash_of_string "") then
-            Hashtbl.replace live_diff_index (file_base, dh) (sha, file);
-          Lwt.return_unit
-        ) diff_tasks in
-        let* () = iter_workers ~n:(ncpu * 2) (fun (id, gi_str, _session_id, _idx, _ts) ->
-          let tbl = parse_git_info gi_str in
-          let changed = ref false in
-          Hashtbl.iter (fun edit_key value ->
-            match value with
-            | Some gi ->
-              if Hashtbl.mem live_shas gi.gi_sha then begin
-                let file_base = match String.split_on_char ':' edit_key with
-                  | fb :: _ -> fb | [] -> "" in
-                match Hashtbl.find_opt live_diff_index (file_base, gi.gi_dh) with
-                | Some (found_sha, _) when found_sha = gi.gi_sha -> ()
-                | _ ->
-                  Hashtbl.replace tbl edit_key None;
-                  changed := true
-              end else begin
-                let file_base = match String.split_on_char ':' edit_key with
-                  | fb :: _ -> fb | [] -> "" in
-                match Hashtbl.find_opt live_diff_index (file_base, gi.gi_dh) with
-                | Some (new_sha, _) ->
-                  Hashtbl.replace tbl edit_key (Some { gi with gi_sha = new_sha });
-                  changed := true;
-                  incr n_relinked
-                | None ->
-                  Hashtbl.replace tbl edit_key None;
-                  changed := true
-              end
-            | None -> ()
-          ) tbl;
-          if !changed then
-            let+ _ok = Urme_search.Chromadb.update_interaction_git_info ~port ~collection_id
-              ~id ~git_info:(serialize_git_info tbl) in ()
-          else Lwt.return_unit
-        ) existing_gis in
-        Lwt.return_unit
-      end
-    in
-
-    (* Phase 3: Build edit index from JSONL — parallel per session *)
-    let p_phase3 =
-      let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir ~project_dir in
-      let all_sessions = Urme_search.Jsonl_reader.list_sessions ~jsonl_dir in
-      let sessions = match sessions_filter with
-        | None -> all_sessions
-        | Some sids ->
-          let sset = Hashtbl.create (List.length sids) in
-          List.iter (fun s -> Hashtbl.replace sset s ()) sids;
-          List.filter (fun path ->
-            let sid = Filename.basename path |> Filename.chop_extension in
-            Hashtbl.mem sset sid
-          ) all_sessions
-      in
-      let matched_keys = Hashtbl.create 256 in
-      let min_matched_ts =
-        List.fold_left (fun acc (_id, gi_str, _sid, _idx, ts_str) ->
-          let tbl = parse_git_info gi_str in
-          let has_match = Hashtbl.fold (fun ek v found ->
-            if v <> None then (Hashtbl.replace matched_keys ek (); true)
-            else found
-          ) tbl false in
-          if has_match && ts_str <> "" then
-            let ts = Urme_core.Types.iso8601_to_epoch ts_str in
-            if ts > 0.0 then Float.min acc ts else acc
-          else acc
-        ) Float.infinity existing_gis in
-      let ts_cutoff = if Float.is_finite min_matched_ts
-        then min_matched_ts else 0.0 in
-      (* Process each session in a separate Domain, collect edits *)
-      let process_session filepath =
-        let session_id = Filename.basename filepath |> Filename.chop_extension in
-        let turns = split_into_turns (load_session_entries filepath) in
-        let interactions = Urme_search.Jsonl_reader.parse_interactions ~filepath in
-        let raw_lines = try
-          let ic = open_in filepath in
-          let ls = ref [] in
-          (try while true do ls := input_line ic :: !ls done with End_of_file -> ());
-          close_in ic; List.rev !ls
-        with _ -> [] in
-        let raw_arr = Array.of_list raw_lines in
-        (* Pass 1: collect refused tool_use_ids from user messages *)
-        let refused_ids = Hashtbl.create 32 in
-        List.iter (fun (interaction : Urme_core.Types.interaction) ->
-          for line_num = interaction.line_start to min interaction.line_end (Array.length raw_arr - 1) do
-            (try
-              let json = Yojson.Safe.from_string raw_arr.(line_num) in
-              let open Yojson.Safe.Util in
-              if json |> member "type" |> to_string_option = Some "user" then
-                let items = json |> member "message" |> member "content"
-                  |> (fun j -> try to_list j with _ -> []) in
-                List.iter (fun item ->
-                  if item |> member "type" |> to_string_option = Some "tool_result" then
-                    let is_err = item |> member "is_error" |> to_bool_option
-                      |> Option.value ~default:false in
-                    if is_err then
-                      match item |> member "tool_use_id" |> to_string_option with
-                      | Some tid -> Hashtbl.replace refused_ids tid ()
-                      | None -> ()
-                ) items
-            with _ -> ())
-          done
-        ) interactions;
-        (* Pass 2: map tool_use_id → interaction index *)
-        let tuid_to_iidx = Hashtbl.create 64 in
-        List.iter (fun (interaction : Urme_core.Types.interaction) ->
-          for line_num = interaction.line_start to min interaction.line_end (Array.length raw_arr - 1) do
-            (try
-              let json = Yojson.Safe.from_string raw_arr.(line_num) in
-              let open Yojson.Safe.Util in
-              if json |> member "type" |> to_string_option = Some "assistant" then
-                let blocks = json |> member "message" |> member "content"
-                  |> (fun j -> try to_list j with _ -> []) in
-                List.iter (fun block ->
-                  if block |> member "type" |> to_string_option = Some "tool_use" then
-                    match block |> member "id" |> to_string_option with
-                    | Some tid -> Hashtbl.replace tuid_to_iidx tid interaction.index
-                    | None -> ()
-                ) blocks
-            with _ -> ())
-          done
-        ) interactions;
-        let edits = ref [] in
-        List.iteri (fun ti turn ->
-          let rec walk = function
-            | Tool_use_block { tool_name = ("Edit" | "Write") as tn;
-                               tool_use_id = tuid; input; timestamp = ts; _ }
-              :: rest ->
-              if Hashtbl.mem refused_ids tuid || ts <= 0.0 || ts < ts_cutoff then walk rest
-              else begin
-                let open Yojson.Safe.Util in
-                let fp = input |> member "file_path" |> to_string_option
-                         |> Option.value ~default:"" in
-                if fp <> "" then begin
-                  let iidx = match Hashtbl.find_opt tuid_to_iidx tuid with
-                    | Some i -> i | None -> 0 in
-                  let file_base = Filename.basename fp in
-                  let new_string = match tn with
-                    | "Edit" -> input |> member "new_string" |> to_string_option
-                                |> Option.value ~default:""
-                    | "Write" -> input |> member "content" |> to_string_option
-                                 |> Option.value ~default:""
-                    | _ -> "" in
-                  let old_string = match tn with
-                    | "Edit" -> input |> member "old_string" |> to_string_option
-                                |> Option.value ~default:""
-                    | _ -> "" in
-                  if new_string <> "" then begin
-                    let ek = make_edit_key ~file_base ~new_string in
-                    if not (Hashtbl.mem matched_keys ek) then
-                      edits := { edit_key = ek; file_base; new_string; old_string;
-                                 timestamp = ts; session_id;
-                                 interaction_index = iidx;
-                                 turn_idx = ti; entry_idx = 0 } :: !edits
-                  end
-                end;
-                walk rest
-              end
-            | _ :: rest -> walk rest
-            | [] -> ()
-          in
-          walk turn
-        ) turns;
-        !edits
-      in
-      (* Sort sessions biggest-first, process in parallel pthreads via
-         Lwt_preemptive.detach — unlike Domain.spawn, this doesn't
-         poison Unix.fork. *)
-      let sorted_sessions = sort_by_size_desc sessions in
-      let q = Queue.create () in
-      List.iter (fun s -> Queue.push s q) sorted_sessions;
-      let results = ref [] in
-      let worker () =
-        let rec loop () =
-          match Queue.take_opt q with
-          | None -> Lwt.return_unit
-          | Some session ->
-            let* edits = Lwt_preemptive.detach process_session session in
-            results := edits :: !results;
-            loop ()
-        in loop ()
-      in
-      let n = min ncpu (Queue.length q) in
-      let* () = Lwt.join (List.init n (fun _ -> worker ())) in
-      let all_edits = List.concat !results in
-      n_edits := List.length all_edits;
-      let sorted_edits = List.sort (fun a b ->
-        Float.compare b.timestamp a.timestamp) all_edits in
-      Lwt.return sorted_edits
-    in
-
-    let* () = p_phase2
-    and* sorted_edits = p_phase3 in
-
-    (* === Phase 4: Commit-centric matching === *)
-    (* Build file_base → edits index for O(1) lookup *)
-    let edit_index = Hashtbl.create 256 in
-    List.iter (fun e ->
-      let existing = match Hashtbl.find_opt edit_index e.file_base with
-        | Some l -> l | None -> [] in
-      Hashtbl.replace edit_index e.file_base (e :: existing)
-    ) sorted_edits;
-    let edit_file_bases = Hashtbl.create (Hashtbl.length edit_index) in
-    Hashtbl.iter (fun fb _ -> Hashtbl.replace edit_file_bases fb ()) edit_index;
-    (* Filter commits to only those touching files we have edits for *)
-    let relevant_commits = List.filter (fun (_sha, _ts, files) ->
-      List.exists (fun f -> Hashtbl.mem edit_file_bases (Filename.basename f)) files
-    ) commits_with_files in
-    let n_relevant = List.length relevant_commits in
-    let* () = update mvar (fun s ->
-      { s with status_extra =
-          Printf.sprintf "Git links: matching %d edits against %d/%d commits..."
-            !n_edits n_relevant !n_commits }) in
-    redraw mvar;
-    let gi_updates : (string, (string * git_info_val option) list) Hashtbl.t =
-      Hashtbl.create 256 in
-    let links : (string * string, git_conv_link list) Hashtbl.t = Hashtbl.create 256 in
-    let* () = iter_workers ~n:(ncpu * 2) (fun (sha, commit_ts, files) ->
-      let relevant_files = List.filter (fun f ->
-        Hashtbl.mem edit_file_bases (Filename.basename f)) files in
-      iter_workers ~n:ncpu (fun file ->
-        let file_base = Filename.basename file in
-        let candidates = match Hashtbl.find_opt edit_index file_base with
-          | Some edits -> List.filter (fun e -> e.timestamp < commit_ts) edits
-          | None -> [] in
-        if candidates = [] then Lwt.return_unit
-        else begin
-          let* file_after = Lwt.catch (fun () ->
-            Urme_store.Project_store.read_blob ~repo ~sha ~path:file
-          ) (fun _ -> Lwt.return_none) in
-          match file_after with
-          | None -> Lwt.return_unit
-          | Some content_after ->
-            let* dh = get_diff_hash sha file in
-            let current_content = ref content_after in
-            let record_match edit =
-              incr n_matched;
-              Hashtbl.replace matched_unique edit.edit_key ();
-              let iid = Printf.sprintf "%s_%d" edit.session_id edit.interaction_index in
-              let existing = match Hashtbl.find_opt gi_updates iid with
-                | Some l -> l | None -> [] in
-              Hashtbl.replace gi_updates iid
-                ((edit.edit_key, Some { gi_sha = sha; gi_dh = dh;
-                                        gi_ti = edit.turn_idx; gi_ei = edit.entry_idx }) :: existing);
-              let link = { commit_sha = sha; file = file_base;
-                           session_id = edit.session_id;
-                           turn_idx = edit.turn_idx; entry_idx = edit.entry_idx;
-                           edit_key = edit.edit_key } in
-              let lk = (sha, file_base) in
-              let el = match Hashtbl.find_opt links lk with
-                | Some l -> l | None -> [] in
-              Hashtbl.replace links lk (el @ [link])
-            in
-            List.iter (fun edit ->
-              if edit.old_string <> "" then begin
-                let cc = !current_content in
-                let pos = string_find_pos edit.new_string cc in
-                if pos >= 0 then begin
-                  let ns_len = String.length edit.new_string in
-                  let cc_len = String.length cc in
-                  let undone = String.sub cc 0 pos ^ edit.old_string ^
-                               String.sub cc (pos + ns_len) (cc_len - pos - ns_len) in
-                  let fname = file_base in
-                  (match Patch.diff (Some (fname, cc)) (Some (fname, undone)) with
-                   | Some reverse_patch ->
-                     let result = try
-                       Patch.patch ~cleanly:true (Some cc) reverse_patch
-                     with _ -> None in
-                     (match result with
-                      | Some new_cc ->
-                        current_content := new_cc;
-                        record_match edit
-                      | None ->
-                        current_content := undone;
-                        record_match edit)
-                   | None ->
-                     current_content := undone;
-                     record_match edit)
-                end
-              end else if edit.new_string <> "" then begin
-                let ns = edit.new_string in
-                let cc = !current_content in
-                let check_len = min (String.length ns) (String.length cc) in
-                if check_len > 20 then begin
-                  let sample = String.sub ns 0 (min 100 (String.length ns)) in
-                  if string_find_pos sample cc >= 0 then begin
-                    record_match edit
-                  end
-                end
-              end
-            ) candidates;
-            Lwt.return_unit
-        end
-      ) relevant_files
-    ) relevant_commits in
-
-    (* === Phase 5: persist to ChromaDB === *)
-    let* () = update mvar (fun s ->
-      { s with status_extra =
-          Printf.sprintf "Git links: persisting %d updates..."
-            (Hashtbl.length gi_updates) }) in
-    redraw mvar;
-
-    let update_list = Hashtbl.fold (fun iid entries acc ->
-      (iid, entries) :: acc) gi_updates [] in
-    let p5_ok = ref 0 in
-    let p5_miss = ref 0 in
-    let p5_err = ref 0 in
-    let* () = iter_workers ~n:ncpu (fun (iid, entries) ->
-      let* existing_meta = Lwt.catch (fun () ->
-        Urme_search.Chromadb.get_interaction_meta ~port ~collection_id ~id:iid
-      ) (fun exn ->
-        log_debug (Printf.sprintf "P5 get_meta err %s: %s" iid (Printexc.to_string exn));
-        Lwt.return_none) in
-      let tbl = match existing_meta with
-        | Some meta ->
-          let open Yojson.Safe.Util in
-          let gi = meta |> member "git_info" |> to_string_option
-            |> Option.value ~default:"" in
-          parse_git_info gi
-        | None ->
-          incr p5_miss;
-          log_debug (Printf.sprintf "P5 miss: %s not in ChromaDB" iid);
-          Hashtbl.create 8 in
-      List.iter (fun (ek, value) ->
-        Hashtbl.replace tbl ek value
-      ) entries;
-      Lwt.catch (fun () ->
-        let+ ok = Urme_search.Chromadb.update_interaction_git_info ~port ~collection_id
-          ~id:iid ~git_info:(serialize_git_info tbl) in
-        if ok then incr p5_ok
-        else begin
-          incr p5_miss;
-          log_debug (Printf.sprintf "P5 update_metadata returned false for %s" iid)
-        end
-      ) (fun exn ->
-        incr p5_err;
-        log_debug (Printf.sprintf "P5 update err %s: %s" iid (Printexc.to_string exn));
-        Lwt.return_unit)
-    ) update_list in
-    log_debug (Printf.sprintf "P5 done: %d ok, %d miss, %d err (of %d total)"
-      !p5_ok !p5_miss !p5_err (List.length update_list));
-
-    (* === Phase 6: rebuild in-memory links from fresh ChromaDB data === *)
-    let* () = update mvar (fun s ->
-      { s with status_extra = "Git links: building link index..." }) in
-    redraw mvar;
-    let* fresh_gis =
-      Urme_search.Chromadb.get_all_with_git_info ~port ~collection_id in
-    List.iter (fun (_id, gi_str, session_id, _idx, _ts) ->
-      let tbl = parse_git_info gi_str in
-      Hashtbl.iter (fun ek value ->
-        match value with
-        | Some gi ->
-          let file_base = match String.split_on_char ':' ek with
-            | fb :: _ -> fb | [] -> "" in
-          if file_base <> "" then begin
-            let lk = (gi.gi_sha, file_base) in
-            let existing = match Hashtbl.find_opt links lk with
-              | Some l -> l | None -> [] in
-            if not (List.exists (fun (l : git_conv_link) -> l.edit_key = ek) existing) then begin
-              let link = { commit_sha = gi.gi_sha; file = file_base;
-                           session_id; turn_idx = gi.gi_ti; entry_idx = gi.gi_ei;
-                           edit_key = ek } in
-              Hashtbl.replace links lk (existing @ [link])
-            end
-          end
-        | None -> ()
-      ) tbl
-    ) fresh_gis;
-
-    Lwt.return (links, !n_edits, Hashtbl.length matched_unique, !n_commits, !n_relinked)
-  ) (fun exn ->
-    let _ = Printexc.to_string exn in
-    Lwt.return (Hashtbl.create 0, !n_edits, Hashtbl.length matched_unique, !n_commits, !n_relinked))
+  let on_status msg =
+    let* () = update mvar (fun s -> { s with status_extra = msg }) in
+    redraw mvar; Lwt.return_unit in
+  Urme_engine.Git_link.update_index ~project_dir ~port ~collection_id
+    ?sessions_filter ~on_status ()
 
 (* ---------- Mode switching helpers ---------- *)
 
@@ -1874,25 +1380,22 @@ let load_git_links_from_chroma ~port ~project =
       Urme_search.Chromadb.ensure_interactions_collection ~port ~project in
     let* existing_gis =
       Urme_search.Chromadb.get_all_with_git_info ~port ~collection_id in
-    log_debug (Printf.sprintf "cold_start: %d entries with git_info" (List.length existing_gis));
     let links : (string * string, git_conv_link list) Hashtbl.t =
       Hashtbl.create 256 in
-    List.iter (fun (id, gi_str, session_id, _idx, _ts) ->
-      log_debug (Printf.sprintf "cold_start entry: id=%s session=%s gi=%s"
-        id session_id (String.sub gi_str 0 (min 100 (String.length gi_str))));
+    List.iter (fun (_id, gi_str, session_id, _idx, _ts) ->
       let tbl = parse_git_info gi_str in
       Hashtbl.iter (fun ek value ->
         match value with
-        | Some gi ->
+        | Some (gi : Urme_engine.Git_link_types.git_info) ->
           let file_base = match String.split_on_char ':' ek with
             | fb :: _ -> fb | [] -> "" in
           if file_base <> "" then begin
-            let lk = (gi.gi_sha, file_base) in
+            let lk = (gi.commit_sha, file_base) in
             let existing = match Hashtbl.find_opt links lk with
               | Some l -> l | None -> [] in
             if not (List.exists (fun (l : git_conv_link) -> l.edit_key = ek) existing) then begin
-              let link = { commit_sha = gi.gi_sha; file = file_base;
-                           session_id; turn_idx = gi.gi_ti; entry_idx = gi.gi_ei;
+              let link : git_conv_link = { commit_sha = gi.commit_sha; file = file_base;
+                           session_id; turn_idx = gi.turn_idx; entry_idx = gi.entry_idx;
                            edit_key = ek } in
               Hashtbl.replace links lk (existing @ [link])
             end
@@ -2079,39 +1582,54 @@ let index_sessions mvar =
       let n_new = ref 0 in
       let n_skip = ref 0 in
       let indexed_count = ref 0 in
-      (* Only save interactions not already in ChromaDB *)
-      let* () = iter_workers ~n:ncpu (fun filepath ->
+      (* Collect all new interactions, then batch-save *)
+      let pending = ref [] in
+      List.iter (fun filepath ->
         let session_id = Filename.basename filepath |> Filename.chop_extension in
         let interactions = Urme_search.Jsonl_reader.parse_interactions ~filepath in
-        if interactions = [] then Lwt.return_unit
-        else begin
+        if interactions <> [] then begin
           incr indexed_count;
-          let* () =
-            if !indexed_count mod 20 = 0 then begin
-              let* () = update mvar (fun s ->
-                { s with status_extra =
-                    Printf.sprintf "Indexing %d/%d (%d new, %d skip)"
-                      !indexed_count total !n_new !n_skip }) in
-              redraw mvar; Lwt.return_unit
-            end else Lwt.return_unit in
-          iteri_workers ~n:ncpu (fun i (interaction : Urme_core.Types.interaction) ->
+          List.iteri (fun i (interaction : Urme_core.Types.interaction) ->
             let id = Printf.sprintf "%s_%d" session_id i in
-            if Hashtbl.mem existing_set id then begin
-              incr n_skip; Lwt.return_unit
-            end else begin
+            if Hashtbl.mem existing_set id then
+              incr n_skip
+            else begin
               incr n_new;
-              Lwt.catch (fun () ->
-                Urme_search.Chromadb.save_interaction ~port ~collection_id
-                  ~experience_id:session_id ~interaction_index:i
-                  ~user_text:interaction.user_text
-                  ~assistant_summary:interaction.assistant_summary
-                  ~user_uuid:interaction.user_uuid
-                  ~timestamp:interaction.timestamp ()
-              ) (fun _exn -> Lwt.return_unit)
+              pending := (id, session_id, i,
+                interaction.user_text, interaction.assistant_summary,
+                interaction.user_uuid, interaction.timestamp) :: !pending
             end
           ) interactions
         end
-      ) sessions in
+      ) sessions;
+      let all_pending = List.rev !pending in
+      let batch_size = 64 in
+      let batches = ref [] in
+      let cur = ref [] in
+      let cur_n = ref 0 in
+      List.iter (fun item ->
+        cur := item :: !cur;
+        incr cur_n;
+        if !cur_n >= batch_size then begin
+          batches := List.rev !cur :: !batches;
+          cur := []; cur_n := 0
+        end
+      ) all_pending;
+      if !cur <> [] then batches := List.rev !cur :: !batches;
+      let all_batches = List.rev !batches in
+      let n_batches = List.length all_batches in
+      let batch_i = ref 0 in
+      let* () = Lwt_list.iter_s (fun batch ->
+        incr batch_i;
+        let* () = update mvar (fun s ->
+          { s with status_extra =
+              Printf.sprintf "Indexing batch %d/%d (%d new, %d skip, %d sessions)"
+                !batch_i n_batches !n_new !n_skip total }) in
+        redraw mvar;
+        Lwt.catch (fun () ->
+          Urme_search.Chromadb.save_interactions_batch ~port ~collection_id batch
+        ) (fun _exn -> Lwt.return_unit)
+      ) all_batches in
       (* Find sessions with interactions missing git_info *)
       let* all_ids =
         Urme_search.Chromadb.get_all_interaction_ids ~port ~collection_id in

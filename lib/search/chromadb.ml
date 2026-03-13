@@ -111,6 +111,27 @@ let embed_text text =
   let* embeddings = Lwt_list.map_s embed_single chunks in
   Lwt.return (average_embeddings embeddings)
 
+(* Batch embed multiple texts at once via Ollama *)
+let embed_texts texts =
+  if texts = [] then Lwt.return []
+  else
+    (* Truncate each text to 2000 chars for embedding *)
+    let truncated = List.map (fun t ->
+      if String.length t <= 2000 then t
+      else String.sub t 0 2000
+    ) texts in
+    let body = `Assoc [
+      "model", `String "nomic-embed-text";
+      "input", `List (List.map (fun t -> `String t) truncated);
+    ] in
+    let+ resp = http_post_raw ~url:(ollama_url ^ "/api/embed") ~body in
+    let open Yojson.Safe.Util in
+    match resp |> member "error" |> to_string_option with
+    | Some err -> failwith (Printf.sprintf "Ollama batch embed error: %s" err)
+    | None ->
+      resp |> member "embeddings" |> to_list
+      |> List.map (fun v -> v |> to_list |> List.map to_float)
+
 (* Summarize then embed *)
 let summarize_and_embed text =
   let* summary = summarize_text text in
@@ -346,6 +367,43 @@ let save_interaction ~port ~collection_id ~experience_id ~interaction_index
   let+ _resp = http_post ~port
     ~path:(Printf.sprintf "/collections/%s/add" collection_id) ~body in
   ()
+
+(* Batch-save multiple interactions in one Ollama + one ChromaDB call.
+   items: list of (id, experience_id, interaction_index, user_text,
+                   assistant_summary, user_uuid, timestamp) *)
+let save_interactions_batch ~port ~collection_id items =
+  if items = [] then Lwt.return_unit
+  else
+    let documents = List.map (fun (_id, _eid, _idx, user_text, assistant_summary, _uuid, _ts) ->
+      let summary_trunc =
+        if String.length assistant_summary <= 500 then assistant_summary
+        else String.sub assistant_summary 0 500 ^ "..." in
+      Printf.sprintf "User: %s\nAssistant: %s" user_text summary_trunc
+    ) items in
+    let* embeddings = embed_texts documents in
+    let ids = List.map (fun (id, _, _, _, _, _, _) -> `String id) items in
+    let metadatas = List.map (fun (_id, eid, idx, user_text, _summary, uuid, ts) ->
+      `Assoc [
+        "experience_id", `String eid;
+        "interaction_index", `Int idx;
+        "user_uuid", `String uuid;
+        "user_text", `String (if String.length user_text <= 200 then user_text
+                              else String.sub user_text 0 200 ^ "...");
+        "timestamp", `String ts;
+      ]
+    ) items in
+    let emb_json = List.map (fun emb ->
+      `List (List.map (fun f -> `Float f) emb)
+    ) embeddings in
+    let body = `Assoc [
+      "ids", `List ids;
+      "documents", `List (List.map (fun d -> `String d) documents);
+      "embeddings", `List emb_json;
+      "metadatas", `List metadatas;
+    ] in
+    let+ _resp = http_post ~port
+      ~path:(Printf.sprintf "/collections/%s/add" collection_id) ~body in
+    ()
 
 (* Update git_info JSON on an existing interaction *)
 let update_interaction_git_info ~port ~collection_id ~id ~git_info =

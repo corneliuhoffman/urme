@@ -1,13 +1,18 @@
 open Lwt.Syntax
 
-(* Run a git command, return stdout (stderr suppressed) *)
-let run_git ~cwd args =
+(* Spawn a process, capture stdout, suppress stderr.
+   Uses Unix.create_process (posix_spawn) — safe after Domain.spawn. *)
+let run_process prog argv =
+  let rd, wr = Unix.pipe ~cloexec:true () in
   let devnull = Unix.openfile "/dev/null" [Unix.O_WRONLY] 0 in
-  let proc = Lwt_process.open_process_in ~stderr:(`FD_move devnull)
-    ("git", Array.of_list ("git" :: "-C" :: cwd :: args)) in
+  let pid = Unix.create_process prog argv Unix.stdin wr devnull in
+  Unix.close wr;
+  Unix.close devnull;
+  let fd = Lwt_unix.of_unix_file_descr rd in
+  let ic = Lwt_io.of_fd ~mode:Lwt_io.input fd in
   let buf = Buffer.create 256 in
   let rec read_all () =
-    let* line = Lwt_io.read_line_opt proc#stdout in
+    let* line = Lwt_io.read_line_opt ic in
     match line with
     | Some l ->
       if Buffer.length buf > 0 then Buffer.add_char buf '\n';
@@ -16,15 +21,33 @@ let run_git ~cwd args =
     | None -> Lwt.return_unit
   in
   let* () = read_all () in
-  let* status = proc#close in
+  let* () = Lwt_io.close ic in
+  let* (_pid, status) = Lwt_unix.waitpid [] pid in
+  Lwt.return (Buffer.contents buf, status)
+
+(* Run a git command, return stdout (stderr suppressed) *)
+let run_git ~cwd args =
+  let argv = Array.of_list ("git" :: "-C" :: cwd :: args) in
+  let* (output, status) = run_process "git" argv in
   match status with
-  | Unix.WEXITED 0 -> Lwt.return (Buffer.contents buf)
+  | Unix.WEXITED 0 -> Lwt.return output
   | Unix.WEXITED n ->
     Lwt.fail_with (Printf.sprintf "git %s failed (exit %d)"
       (String.concat " " args) n)
   | _ ->
     Lwt.fail_with (Printf.sprintf "git %s killed by signal"
       (String.concat " " args))
+
+(* Run a shell command, return stdout *)
+let run_shell cmd =
+  let argv = [| "/bin/sh"; "-c"; cmd |] in
+  let* (output, status) = run_process "/bin/sh" argv in
+  match status with
+  | Unix.WEXITED 0 -> Lwt.return output
+  | Unix.WEXITED n ->
+    Lwt.fail_with (Printf.sprintf "shell command failed (exit %d): %s" n cmd)
+  | _ ->
+    Lwt.fail_with (Printf.sprintf "shell command killed: %s" cmd)
 
 let run_git_opt ~cwd args =
   Lwt.catch
