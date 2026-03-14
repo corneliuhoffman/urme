@@ -246,8 +246,9 @@ let decompose_diff ~sha ~file ~branch_label ~edits ~cwd ~repo =
     if List.length parents <= 1 then begin
       let matched = match_edits ~content_before ~content_after ~commit_ts ~file_base
         ~branch_filter:branch ~warnings edits in
+      let warn_items = List.map (fun w -> Unexplained w) !warnings in
       Lwt.return { commit_sha = sha; file = file_base;
-                   items = List.map (fun e -> DirectEdit e) matched }
+                   items = List.map (fun e -> DirectEdit e) matched @ warn_items }
     end else begin
       let theirs_parent = List.nth parents 1 in
       let theirs_branch = match Hashtbl.find_opt branch_label theirs_parent with

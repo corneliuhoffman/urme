@@ -59,6 +59,12 @@ let () =
           let matched = List.filter_map (fun item ->
             match item with DirectEdit e -> Some e | _ -> None
           ) d.items in
+          let warns = List.filter_map (fun item ->
+            match item with Unexplained w -> Some w | _ -> None
+          ) d.items in
+          List.iter (fun w ->
+            Printf.printf "    WARN %s %s: %s\n%!" short (Filename.basename file) w
+          ) warns;
           if matched = [] then begin
             incr n_skip; Lwt.return_unit
           end else begin

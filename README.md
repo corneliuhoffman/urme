@@ -199,6 +199,35 @@ When the user says "replay experience ...":
 - Present the returned steps and conversations for reference
 ```
 
+## Git-Claude Linking Engine
+
+The `lib/engine/` implements an algorithm that decomposes git diffs into attributed Claude edits — connecting every line change in a commit back to the specific Claude conversation turn that produced it.
+
+### How it works
+
+Given a commit SHA, the engine:
+
+1. **Extracts edits** from all Claude JSONL session files (`edit_extract.ml`) — every `Edit` and `Write` tool call, with timestamps, old/new strings, and refused-edit filtering.
+2. **Labels branches** (`branch_topo.ml`) — maps each commit to its original branch name to scope edit matching.
+3. **Matches edits to diffs** (`diff_match.ml`) — walks candidate edits newest-first, undoing each one from `content_after` toward `content_before`:
+   - If the edit's `new_string` is found in the current content, undo it (replace with `old_string`).
+   - For ambiguous positions (same `new_string` at multiple locations), use `Patch` hunk line ranges to pick the correct one by checking which hunk's removed lines contain the `old_string`.
+   - If a `new_string` is **not** found (a human edited the file between Claude turns), use surrounding context from `content_after` to locate the region, extract the manual change, record it as a human edit, and continue.
+4. **Orchestrates** the full index update (`git_link.ml`) — parallel commit scanning, ChromaDB persistence, stale-ref relinking.
+
+### Provenance types
+
+Each matched chaaged is classified as one of:
+
+- `DirectEdit` — a Claude edit that directly produced a diff hunk
+- `Incoming` — edits from a merged branch
+- `ConflictResolution` — a Claude edit resolving a merge conflict
+- `Unexplained` — a change not attributable to any Claude edit (manual/human change)
+
+### Testing
+
+`test/test_engine.ml` runs round-trips:w: test: for each recent commit and changed file, it matches Claude edits, undoes them newest-first, and verifies the result equals the parent commit's content.
+
 ## Author
 
 Corneliu Hoffman, 2026
