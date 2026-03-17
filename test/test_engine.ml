@@ -14,7 +14,7 @@ let () =
 
     let* labels = Urme_engine.Branch_topo.label_commits ~cwd:project_dir in
     let* log = Urme_git.Ops.run_git ~cwd:project_dir
-      ["log"; "--format=%H"; "--max-count=10"] in
+      ["log"; "--format=%H"] in
     let shas = String.split_on_char '\n' log
       |> List.filter (fun s -> String.trim s <> "") in
     let* repo = Urme_store.Project_store.open_repo ~project_dir in
@@ -49,10 +49,32 @@ let () =
               Option.value c ~default:""
             ) (fun _ -> Lwt.return "")
           | None -> Lwt.return "" in
+        (* For new files, detect renames and use the old path's content *)
+        let* content_before =
+          if content_before <> "" || parent = None then Lwt.return content_before
+          else
+            let* rename_out = Lwt.catch (fun () ->
+              Urme_git.Ops.run_git ~cwd:project_dir
+                ["diff-tree"; "--no-commit-id"; "-r"; "-M10";
+                 "--diff-filter=R"; "--name-status"; sha]
+            ) (fun _ -> Lwt.return "") in
+            let old_path = String.split_on_char '\n' rename_out
+              |> List.filter (fun s -> String.trim s <> "")
+              |> List.find_map (fun line ->
+                match String.split_on_char '\t' line with
+                | [_status; old_p; new_p] when new_p = file -> Some old_p
+                | _ -> None) in
+            match old_path with
+            | Some old_p ->
+              Lwt.catch (fun () ->
+                let+ c = Urme_store.Project_store.read_blob ~repo
+                  ~sha:(Option.get parent) ~path:old_p in
+                Option.value c ~default:""
+              ) (fun _ -> Lwt.return "")
+            | None -> Lwt.return "" in
 
         match content_after_opt with
         | None -> incr n_skip; Lwt.return_unit
-        | Some _ when content_before = "" -> incr n_skip; Lwt.return_unit
         | Some content_after ->
           let* d = Urme_engine.Diff_match.decompose_diff
             ~sha ~file ~branch_label:labels ~edits ~cwd:project_dir ~repo in

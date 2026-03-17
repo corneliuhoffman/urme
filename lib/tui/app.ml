@@ -939,7 +939,7 @@ let draw_git_left_panels ctx state =
   let link_items = List.map (fun (link : git_conv_link) ->
     let sid = if String.length link.session_id > 4
       then String.sub link.session_id 0 4 else link.session_id in
-    (Printf.sprintf " %s t%d e%d" sid (link.turn_idx + 1) link.entry_idx, false, false)
+    (Printf.sprintf " %s t%d e%d" sid link.turn_idx link.entry_idx, false, false)
   ) g.link_candidates in
   let panels = [
     ("Branches", g.focus = Branches, branch_items, g.branch_idx);
@@ -2505,8 +2505,11 @@ let run ~config ~project_dir () =
                  ~project_dir:s.project_dir in
              let path = Filename.concat jsonl_dir (link.session_id ^ ".jsonl") in
              if Sys.file_exists path then begin
-               let turns = split_into_turns (load_session_entries path) in
-               let ti = min link.turn_idx (max 0 (List.length turns - 1)) in
+               (* Use interaction-aligned turns to match edit_extract's counting
+                  (only String user messages start turns, not tool-result text) *)
+               let turns = split_into_interaction_turns ~filepath:path in
+               (* turn_idx is 1-based from edit_extract; turns list is 0-indexed *)
+               let ti = min (max 0 (link.turn_idx - 1)) (max 0 (List.length turns - 1)) in
                let new_session_idx =
                  let target = link.session_id ^ ".jsonl" in
                  let rec find i = function
@@ -2514,15 +2517,35 @@ let run ~config ~project_dir () =
                    | p :: rest ->
                      if Filename.basename p = target then i else find (i + 1) rest
                  in find 0 s.history.sessions in
+               (* Find actual entry position: entry_idx counts only Edit/Write,
+                  but hist_scroll indexes all entries in the turn *)
+               let scroll_pos = match List.nth_opt turns ti with
+                 | Some entries ->
+                   let edit_count = ref 0 in
+                   let pos = ref 0 in
+                   let found = ref false in
+                   List.iteri (fun i entry ->
+                     if not !found then
+                       match entry with
+                       | Tool_use_block { tool_name; _ }
+                         when tool_name = "Edit" || tool_name = "Write" ->
+                         if !edit_count = link.entry_idx then begin
+                           pos := i; found := true
+                         end;
+                         incr edit_count
+                       | _ -> ()
+                   ) entries;
+                   !pos
+                 | None -> 0 in
                Lwt_mvar.put mvar { s with
                  mode = History;
                  history = { s.history with
                    showing_results = false;
                    session_idx = new_session_idx;
-                   turns; turn_idx = ti; hist_scroll = link.entry_idx;
+                   turns; turn_idx = ti; hist_scroll = scroll_pos;
                    return_mode = Git };
                  status_extra = Printf.sprintf "Session: %s turn %d entry %d"
-                   link.session_id (ti + 1) link.entry_idx }
+                   link.session_id (ti + 1) scroll_pos }
              end else
                Lwt_mvar.put mvar { s with
                  status_extra = Printf.sprintf "Session %s not found" link.session_id }

@@ -260,6 +260,29 @@ let decompose_diff ~sha ~file ~branch_label ~edits ~cwd ~repo =
           Option.value c ~default:""
         ) (fun _ -> Lwt.return "")
       | [] -> Lwt.return "" in
+    (* For new files, detect renames and use the old path's content *)
+    let* content_before =
+      if content_before <> "" || parents = [] then Lwt.return content_before
+      else
+        let* rename_out = Lwt.catch (fun () ->
+          Urme_git.Ops.run_git ~cwd
+            ["diff-tree"; "--no-commit-id"; "-r"; "-M10";
+             "--diff-filter=R"; "--name-status"; sha]
+        ) (fun _ -> Lwt.return "") in
+        let old_path = String.split_on_char '\n' rename_out
+          |> List.filter (fun s -> String.trim s <> "")
+          |> List.find_map (fun line ->
+            match String.split_on_char '\t' line with
+            | [_status; old_p; new_p] when new_p = file -> Some old_p
+            | _ -> None) in
+        match old_path with
+        | Some old_p ->
+          let parent = List.hd parents in
+          Lwt.catch (fun () ->
+            let+ c = Urme_store.Project_store.read_blob ~repo ~sha:parent ~path:old_p in
+            Option.value c ~default:""
+          ) (fun _ -> Lwt.return "")
+        | None -> Lwt.return "" in
     let warnings = ref [] in
     if List.length parents <= 1 then begin
       let (matched, result) = match_edits ~content_before ~content_after ~commit_ts ~file_base

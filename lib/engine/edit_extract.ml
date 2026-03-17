@@ -39,6 +39,7 @@ let edits_of_session ~filepath =
   (* Pass 2: track interaction boundaries, extract edits *)
   let current_iidx = ref 0 in
   let current_branch = ref "" in
+  let edit_in_turn = ref 0 in
   let edits = ref [] in
   List.iter (fun line ->
     match parse_json_safe line with
@@ -51,6 +52,7 @@ let edits_of_session ~filepath =
         (match content with
          | `String _ ->
            incr current_iidx;
+           edit_in_turn := 0;
            let branch = json |> member "gitBranch" |> to_string_option
              |> Option.value ~default:"" in
            if branch <> "" then current_branch := branch
@@ -61,10 +63,7 @@ let edits_of_session ~filepath =
         let ts = Urme_core.Types.iso8601_to_epoch ts_str in
         let blocks = json |> member "message" |> member "content"
           |> (fun j -> try to_list j with _ -> []) in
-        let ei = ref 0 in
         List.iter (fun block ->
-          let entry_idx = !ei in
-          incr ei;
           if block |> member "type" |> to_string_option = Some "tool_use" then begin
             let name = block |> member "name" |> to_string_option
               |> Option.value ~default:"" in
@@ -93,10 +92,12 @@ let edits_of_session ~filepath =
                   | _ -> false in
                 if new_string <> "" then begin
                   let ek = make_edit_key ~file_base ~old_string ~new_string in
+                  let eidx = !edit_in_turn in
+                  incr edit_in_turn;
                   edits := { edit_key = ek; file_base; new_string; old_string;
                              replace_all; timestamp = ts; session_id;
                              interaction_index = !current_iidx;
-                             turn_idx = !current_iidx; entry_idx;
+                             turn_idx = !current_iidx; entry_idx = eidx;
                              git_branch = !current_branch } :: !edits
                 end
               end
