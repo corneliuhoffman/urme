@@ -947,9 +947,21 @@ let draw_git_left_panels ctx state =
     if c <> 0 then c else Int.compare a.entry_idx b.entry_idx
   ) g.link_candidates in
   let link_items = List.map (fun (link : git_conv_link) ->
-    let sid = if String.length link.session_id > 4
-      then String.sub link.session_id 0 4 else link.session_id in
-    (Printf.sprintf " %s t%d e%d" sid (link.turn_idx + 1) link.entry_idx, false, false)
+    let is_human_only = let ek = link.edit_key in
+      String.length ek > 11 &&
+      String.sub ek (String.length ek - 11) 11 = ":human-only" in
+    let is_human_mod = let ek = link.edit_key in
+      String.length ek > 6 &&
+      String.sub ek (String.length ek - 6) 6 = ":human" in
+    let is_human = is_human_only || is_human_mod in
+    if is_human_only then
+      (" H human edit", true, false)
+    else
+      let sid = if String.length link.session_id > 4
+        then String.sub link.session_id 0 4 else link.session_id in
+      let marker = if is_human_mod then "H" else " " in
+      (Printf.sprintf "%s%s t%d e%d" marker sid (link.turn_idx + 1) link.entry_idx,
+       is_human, false)
   ) sorted_links in
   let panels = [
     ("Branches", g.focus = Branches, branch_items, g.branch_idx);

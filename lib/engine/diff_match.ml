@@ -68,7 +68,7 @@ let disambiguate ~content_before ~after_ranges positions cc needle_len =
    Only matches edits that explain the delta from content_before to content_after.
    Uses Patch hunks to disambiguate when the same substring appears at multiple positions.
    Returns matched edits in application order (oldest first). *)
-let match_edits ~content_before ~content_after ~commit_ts ~file_base ~branch_filter ~warnings edits =
+let match_edits ~content_before ~content_after ~commit_ts ~file_base ~branch_filter ~warnings ~human_items edits =
   let candidates = edits
     |> List.filter (fun e ->
       e.file_base = file_base &&
@@ -95,23 +95,16 @@ let match_edits ~content_before ~content_after ~commit_ts ~file_base ~branch_fil
            Check if old_string is in content_before to confirm this edit
            belongs to this commit, then find what replaced new_string. *)
         if find_substring edit.old_string content_before <> None then begin
-          (* This edit belongs to this commit but human modified the result.
-             Try to find old_string in current — if it's there, the human
-             reverted Claude's change. *)
           let cc = !current in
           match find_substring edit.old_string cc with
-          | Some pos ->
-            (* old_string is still in current — human reverted this edit.
-               Record as human edit with the original content. *)
-            let context_start = max 0 (pos - 20) in
-            let context_end = min (String.length cc) (pos + String.length edit.old_string + 20) in
-            let human_text = String.sub cc context_start (context_end - context_start) in
-            matched := edit :: !matched;
+          | Some _pos ->
+            (* old_string still in current — human reverted Claude's change *)
+            human_items := HumanEdit (edit, "human kept original") :: !human_items;
             warnings := (Printf.sprintf "HUMAN %s: human kept original (reverted Claude)"
-              edit.edit_key) :: !warnings;
-            ignore human_text
+              edit.edit_key) :: !warnings
           | None ->
-            (* Neither old_string nor new_string in current — human rewrote this section *)
+            (* Neither old_string nor new_string — human rewrote this section *)
+            human_items := HumanEdit (edit, "human rewrote") :: !human_items;
             warnings := (Printf.sprintf "HUMAN %s: human rewrote this section"
               edit.edit_key) :: !warnings
         end else
@@ -283,24 +276,33 @@ let decompose_diff ~sha ~file ~branch_label ~edits ~cwd ~repo =
           ) (fun _ -> Lwt.return "")
         | None -> Lwt.return "" in
     let warnings = ref [] in
+    let human_items = ref [] in
     if List.length parents <= 1 then begin
       let (matched, result) = match_edits ~content_before ~content_after ~commit_ts ~file_base
-        ~branch_filter:branch ~warnings edits in
+        ~branch_filter:branch ~warnings ~human_items edits in
       let warn_items = List.map (fun w -> Unexplained w) !warnings in
+      (* Build interleaved items: matched edits become DirectEdit,
+         human_items are already interleaved from match_edits processing order *)
+      let all_items = List.rev_map (fun e -> DirectEdit e) matched in
+      let human = !human_items in
+      (* Merge by reversing both (they were prepended newest-first) and combining *)
+      let interleaved = List.rev (all_items @ human) in
       Lwt.return { commit_sha = sha; file = file_base;
-                   items = List.map (fun e -> DirectEdit e) matched @ warn_items; result }
+                   items = interleaved @ warn_items; result }
     end else begin
       let theirs_parent = List.nth parents 1 in
       let theirs_branch = match Hashtbl.find_opt branch_label theirs_parent with
         | Some b -> b | None -> "" in
       let (ours, result) = match_edits ~content_before ~content_after ~commit_ts ~file_base
-        ~branch_filter:branch ~warnings edits in
+        ~branch_filter:branch ~warnings ~human_items edits in
       let (theirs, _) = match_edits ~content_before ~content_after ~commit_ts ~file_base
-        ~branch_filter:theirs_branch ~warnings edits in
+        ~branch_filter:theirs_branch ~warnings ~human_items edits in
+      let human = List.rev !human_items in
       let items =
         List.map (fun e -> DirectEdit e) ours @
         (if theirs <> [] then
            [Incoming (List.map (fun e -> DirectEdit e) theirs, theirs_branch)]
-         else []) in
+         else []) @
+        human in
       Lwt.return { commit_sha = sha; file = file_base; items; result }
     end

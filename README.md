@@ -1,6 +1,6 @@
-# Experience Agents
+# Experience Agents (urme)
 
-OCaml MCP server that gives Claude Code persistent experience memory — save, search, replay, and undo past work across sessions.
+OCaml TUI + MCP server for linking git history to Claude Code conversations. Browse commits, see which Claude edits explain each diff, detect human edit modifications, and search past interactions.
 
 ## How It Works
 
@@ -21,11 +21,6 @@ make clean   # remove build artifacts
 ```
 
 
-`start.sh` will:
-1. Check for Ollama and ChromaDB, offer to install if missing (supports macOS/apt/dnf/pacman)
-2. Pull the `nomic-embed-text` embedding model
-3. Start both services in the background
-4. Offer to register the MCP server globally in Claude Code
 
 ## Manual Setup
 

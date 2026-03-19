@@ -291,29 +291,30 @@ let update_index ~project_dir ~port ~collection_id
       Hashtbl.create 256 in
     let links : (string * string, link list) Hashtbl.t = Hashtbl.create 256 in
     let human_edits : (string * string, bool) Hashtbl.t = Hashtbl.create 256 in
-    let* () = lwt_iter ~n:(ncpu * 2) (fun (sha, commit_ts, files) ->
-      let relevant_files = List.filter (fun f ->
-        Hashtbl.mem edit_file_bases (Filename.basename f)) files in
+    let* branch_label = Branch_topo.label_commits ~cwd:project_dir in
+    (* Process commits oldest-first; consume matched edits so they
+       don't re-match on later commits *)
+    let consumed : (string, unit) Hashtbl.t = Hashtbl.create 256 in
+    let commits_oldest_first = List.sort (fun (_, ts_a, _) (_, ts_b, _) ->
+      Float.compare ts_a ts_b) relevant_commits in
+    let* () = Lwt_list.iter_s (fun (sha, _commit_ts, files) ->
+      let available_edits = List.filter (fun (e : edit) ->
+        not (Hashtbl.mem consumed e.edit_key)) sorted_edits in
       lwt_iter ~n:ncpu (fun file ->
         let file_base = Filename.basename file in
-        let candidates = match Hashtbl.find_opt edit_index file_base with
-          | Some edits -> List.filter (fun e -> e.timestamp < commit_ts) edits
-          | None -> [] in
-        if candidates = [] then Lwt.return_unit
-        else begin
-          let* file_after = Lwt.catch (fun () ->
-            Urme_store.Project_store.read_blob ~repo ~sha ~path:file
-          ) (fun _ -> Lwt.return_none) in
-          match file_after with
-          | None -> Lwt.return_unit
-          | Some content_after ->
-            let* dh = get_diff_hash sha file in
-            let current_content = ref content_after in
-            let record_match (edit : edit) =
+        let has_edit_candidates = Hashtbl.mem edit_file_bases file_base in
+        if has_edit_candidates then begin
+          let* d = Diff_match.decompose_diff ~sha ~file
+              ~branch_label ~edits:available_edits ~cwd:project_dir ~repo in
+          let* dh = get_diff_hash sha file in
+          let has_claude = ref false in
+          List.iter (fun item ->
+            match item with
+            | DirectEdit edit ->
+              has_claude := true;
               incr n_matched;
+              Hashtbl.replace consumed edit.edit_key ();
               Hashtbl.replace matched_unique edit.edit_key ();
-              (* interaction_index is 1-based from edit_extract;
-                 ChromaDB IDs are 0-based from parse_interactions *)
               let iid = Printf.sprintf "%s_%d" edit.session_id
                 (edit.interaction_index - 1) in
               let existing = match Hashtbl.find_opt gi_updates iid with
@@ -331,49 +332,50 @@ let update_index ~project_dir ~port ~collection_id
               let lk = (sha, file_base) in
               let el = match Hashtbl.find_opt links lk with
                 | Some l -> l | None -> [] in
-              Hashtbl.replace links lk (el @ [lnk])
-            in
-            let stop = ref false in
-            List.iter (fun edit ->
-              if !stop then ()
-              else if edit.old_string <> "" then begin
-                let cc = !current_content in
-                match find_substring edit.new_string cc with
-                | None ->
-                  (* Claude's new_string not found — human may have modified it *)
-                  if find_substring edit.old_string cc <> None then
-                    (* old_string still there: human reverted/modified Claude's edit *)
-                    Hashtbl.replace human_edits (sha, file_base) true
-                | Some pos ->
-                  let ns_len = String.length edit.new_string in
-                  let cc_len = String.length cc in
-                  let undone = String.sub cc 0 pos ^ edit.old_string ^
-                    String.sub cc (pos + ns_len) (cc_len - pos - ns_len) in
-                  let fname = file_base in
-                  (match Patch.diff (Some (fname, cc)) (Some (fname, undone)) with
-                   | Some reverse_patch ->
-                     (match (try Patch.patch ~cleanly:true (Some cc) reverse_patch
-                             with _ -> None) with
-                      | Some new_cc ->
-                        current_content := new_cc; record_match edit
-                      | None ->
-                        current_content := undone; record_match edit)
-                   | None ->
-                     current_content := undone; record_match edit)
-              end else if edit.new_string <> "" then begin
-                (* Write = full file replacement. Record it and stop —
-                   everything older is superseded *)
-                record_match edit;
-                stop := true
-              end
-            ) candidates;
-            (* If content wasn't fully undone, human also edited this file *)
-            if !current_content <> "" && !current_content <> content_after then
+              if not (List.exists (fun (l : link) -> l.edit_key = edit.edit_key) el) then
+                Hashtbl.replace links lk (el @ [lnk])
+            | HumanEdit (edit, _desc) ->
               Hashtbl.replace human_edits (sha, file_base) true;
-            Lwt.return_unit
+              let lnk = { commit_sha = sha; file = file_base;
+                          session_id = edit.session_id;
+                          turn_idx = edit.turn_idx;
+                          entry_idx = edit.entry_idx;
+                          edit_key = edit.edit_key ^ ":human" } in
+              let lk = (sha, file_base) in
+              let el = match Hashtbl.find_opt links lk with
+                | Some l -> l | None -> [] in
+              if not (List.exists (fun (l : link) -> l.edit_key = lnk.edit_key) el) then
+                Hashtbl.replace links lk (el @ [lnk])
+            | Unexplained msg when String.length msg > 5 &&
+                String.sub msg 0 5 = "HUMAN" ->
+              Hashtbl.replace human_edits (sha, file_base) true
+            | _ -> ()
+          ) d.items;
+          (* If no Claude edits matched but file changed, it's purely human *)
+          if not !has_claude then begin
+            Hashtbl.replace human_edits (sha, file_base) true;
+            (* Create a placeholder link so the file is accessible *)
+            let lk = (sha, file_base) in
+            if not (Hashtbl.mem links lk) then
+              let lnk = { commit_sha = sha; file = file_base;
+                          session_id = ""; turn_idx = 0; entry_idx = 0;
+                          edit_key = file_base ^ ":human-only" } in
+              Hashtbl.replace links lk [lnk]
+          end;
+          Lwt.return_unit
+        end else begin
+          (* No Claude edit candidates at all — purely human edit *)
+          Hashtbl.replace human_edits (sha, file_base) true;
+          let lk = (sha, file_base) in
+          (if not (Hashtbl.mem links lk) then
+            let lnk = { commit_sha = sha; file = file_base;
+                        session_id = ""; turn_idx = 0; entry_idx = 0;
+                        edit_key = file_base ^ ":human-only" } in
+            Hashtbl.replace links lk [lnk]);
+          Lwt.return_unit
         end
-      ) relevant_files
-    ) relevant_commits in
+      ) files
+    ) commits_oldest_first in
 
     (* Phase 5: persist to ChromaDB *)
     let* () = status (Printf.sprintf "Git links: persisting %d updates..."
