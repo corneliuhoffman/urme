@@ -277,9 +277,8 @@ type state = {
   daemon : Urme_claude.Process.t option;
   pending : pending_approval option;
   perm_server : Permission_server.t option;
-  ui : LTerm_ui.t option;
   status_model : string;
-  context_tokens : int;  (* latest input_tokens = current context window fill *)
+  context_tokens : int;
   status_tokens_in : int;
   status_tokens_out : int;
   status_cost : float;
@@ -315,7 +314,7 @@ let initial_state ~config ~project_dir = {
   active_pane = `Conv; diff_text = ""; diff_scroll = 0;
   streaming = false; stream_text = "";
   config; project_dir;
-  daemon = None; pending = None; perm_server = None; ui = None;
+  daemon = None; pending = None; perm_server = None;
   status_model = ""; context_tokens = 0; status_tokens_in = 0; status_tokens_out = 0;
   status_cost = 0.0; status_extra = "Ready";
   tool_use_map = []; verbose = false;
@@ -332,15 +331,18 @@ let append_diff s diff =
     diff_scroll = 0;
   }
 
-let redraw mvar =
-  match peek mvar with
-  | Some s -> (match s.ui with Some ui -> LTerm_ui.draw ui | None -> ())
-  | None -> ()
+(* ---------- Terminal ref + redraw (forward-declared, filled in after render_screen) ---------- *)
+
+let term_ref : Notty_lwt.Term.t option ref = ref None
+
+(* redraw is defined after render_screen; use a ref for forward reference *)
+let redraw_ref : (state Lwt_mvar.t -> unit) ref = ref (fun _ -> ())
+let redraw mvar = !redraw_ref mvar
 
 (* ---------- Colors (from config theme) ---------- *)
 
 let _theme = (Urme_core.Config.load ()).theme
-let lc (c : Urme_core.Config.rgb) = LTerm_style.rgb c.r c.g c.b
+let lc (c : Urme_core.Config.rgb) = Notty.A.rgb_888 ~r:c.r ~g:c.g ~b:c.b
 let c_bg = lc _theme.bg
 let c_fg = lc _theme.fg
 let c_border = lc _theme.border
@@ -370,7 +372,12 @@ let sanitize_utf8 s =
     else
       let byte = Char.code s.[i] in
       if byte < 0x80 then begin
-        Buffer.add_char buf s.[i]; loop (i + 1)
+        (* Replace control chars (below 0x20) with space, except allow nothing below *)
+        if byte >= 0x20 || byte = 0x09 then  (* allow tab *)
+          Buffer.add_char buf s.[i]
+        else
+          Buffer.add_char buf ' ';
+        loop (i + 1)
       end else
         let expected =
           if byte land 0xE0 = 0xC0 then 2
@@ -391,17 +398,6 @@ let sanitize_utf8 s =
           end
   in
   loop 0
-
-let draw_str ctx row col ~style text =
-  let size = LTerm_draw.size ctx in
-  if row >= 0 && row < size.rows then begin
-    let max_len = max 0 (size.cols - col) in
-    let text = if String.length text > max_len then
-      String.sub text 0 max_len else text in
-    if String.length text > 0 then
-      LTerm_draw.draw_string ctx row col
-        ~style (Zed_string.of_utf8 (sanitize_utf8 text))
-  end
 
 let wrap_text text width =
   if width <= 0 then [""]
@@ -598,7 +594,7 @@ let load_session_entries filepath =
   List.rev !entries
 
 (* Split session into interaction-aligned turns by parsing JSONL directly.
-   Each turn = one real user interaction (type=user, content=String → assistant response).
+   Each turn = one real user interaction (type=user, content=String -> assistant response).
    Esc/cancel and tool result messages don't start new turns. *)
 let split_into_interaction_turns ~filepath =
   let turns = ref [] in
@@ -698,8 +694,8 @@ let truncate_result content =
 (* ---------- Rendering ---------- *)
 
 type styled_line = {
-  fg : LTerm_style.color;
-  bg : LTerm_style.color option;
+  fg : Notty.A.color;
+  bg : Notty.A.color option;
   text : string;
 }
 
@@ -777,16 +773,88 @@ let render_entry ~width ~verbose entry =
   | Turn_separator ->
     [mk c_separator ("  " ^ String.make (min 40 (width - 2)) '-'); mk c_fg ""]
 
-let draw_conversation ctx state =
-  let size = LTerm_draw.size ctx in
-  LTerm_draw.fill_style ctx
-    LTerm_style.{ none with background = Some c_bg; foreground = Some c_fg };
+(* ---------- Notty image builders ---------- *)
+
+(* Local infix operators to avoid opening Notty.I (which shadows width, height, pad, empty, string) *)
+let ( <|> ) = Notty.I.( <|> )
+let ( <-> ) = Notty.I.( <-> )
+let ( </> ) = Notty.I.( </> )
+
+(* Build a single row image of exactly width w, with given attr *)
+let mk_row ~attr w text =
+  let text = sanitize_utf8 text in
+  let len = String.length text in
+  if len = 0 then
+    Notty.I.char attr ' ' w 1
+  else
+    let display_len = min len w in
+    let text = if display_len < len then String.sub text 0 display_len else text in
+    let pad_n = max 0 (w - display_len) in
+    let txt_img = (try Notty.I.string attr text
+      with _ -> Notty.I.string attr (String.make display_len '?')) in
+    if pad_n > 0 then txt_img <|> Notty.I.char attr ' ' pad_n 1
+    else txt_img
+
+(* Build an empty background block *)
+let bg_block w h =
+  Notty.I.char Notty.A.(bg c_bg) ' ' w h
+
+(* Render the status bar (1 row) *)
+let render_status_bar state w =
+  let sbg = Notty.A.(fg c_fg ++ bg c_status_bg) in
+  let mode_tag = match state.mode with
+    | Conv -> "CONV" | Git -> "GIT" | History -> "HIST" in
+  let model = if state.status_model = "" then "urme" else state.status_model in
+  let ctx_str =
+    if state.context_tokens > 0 then
+      Printf.sprintf " %dk/200k" (state.context_tokens / 1000)
+    else "" in
+  let left = Printf.sprintf " [%s] %s%s" mode_tag model ctx_str in
+  let right_str = match state.config.plan, state.usage with
+    | (Urme_core.Config.Pro | Urme_core.Config.Max), Some u ->
+      let usage_str = Urme_core.Usage.format_status_bar u in
+      if state.status_tokens_in > 0 || state.status_tokens_out > 0 then
+        Printf.sprintf "%dk in / %dk out | %s"
+          (state.status_tokens_in / 1000) (state.status_tokens_out / 1000)
+          usage_str
+      else usage_str
+    | _ ->
+      if state.status_tokens_in > 0 || state.status_tokens_out > 0 then
+        Printf.sprintf "%dk in / %dk out | $%.4f"
+          (state.status_tokens_in / 1000) (state.status_tokens_out / 1000)
+          state.status_cost
+      else ""
+  in
+  (* Build the bar: left portion (bold highlight), center (status_extra), right *)
+  let left_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
+  let left_img = mk_row ~attr:left_attr (String.length left) left in
+  let right_len = String.length right_str in
+  let center_start = max (String.length left + 2)
+      ((w - String.length state.status_extra) / 2) in
+  let center_end = center_start + String.length state.status_extra in
+  let right_start = max 0 (w - right_len - 1) in
+  (* Build as a single row: pad left, center text, right text *)
+  let gap1 = max 0 (center_start - String.length left) in
+  let gap2 = max 0 (right_start - center_end) in
+  let remaining = max 0 (w - right_start - right_len) in
+  let open Notty.I in
+  left_img
+  <|> char sbg ' ' gap1 1
+  <|> (try string sbg (sanitize_utf8 state.status_extra) with _ -> empty)
+  <|> char sbg ' ' gap2 1
+  <|> (if right_len > 0 then
+         (try string sbg (sanitize_utf8 right_str) with _ -> empty)
+       else empty)
+  <|> char sbg ' ' remaining 1
+
+(* Render the conversation pane *)
+let render_conversation state w h =
+  let base_attr = Notty.A.(fg c_fg ++ bg c_bg) in
   let title = if state.verbose then " Conversation [verbose]" else " Conversation" in
-  draw_str ctx 0 0
-    ~style:LTerm_style.{ none with background = Some c_status_bg;
-                                    foreground = Some c_highlight; bold = Some true }
-    (Printf.sprintf "%s%s" title (String.make (max 0 (size.cols - String.length title)) ' '));
-  let width = max 1 (size.cols - 2) in
+  let title_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
+  let title_row = mk_row ~attr:title_attr w title in
+  let content_h = max 0 (h - 1) in
+  let width = max 1 (w - 2) in
   let all_lines =
     List.concat_map (render_entry ~width ~verbose:state.verbose)
       (List.rev state.entries) in
@@ -795,84 +863,105 @@ let draw_conversation ctx state =
       all_lines @ List.map (fun l -> { fg = c_assistant; bg = None; text = "  " ^ l })
         (wrap_text state.stream_text width)
     else all_lines in
-  let visible_height = max 0 (size.rows - 1) in
   let total = List.length all_lines in
-  let start = max 0 (total - visible_height - state.scroll_offset) in
-  List.filteri (fun i _ -> i >= start && i < start + visible_height) all_lines
-  |> List.iteri (fun i line ->
-    let row = 1 + i in
-    if row < size.rows then
-      draw_str ctx row 1
-        ~style:LTerm_style.{ none with
-          background = Some (match line.bg with Some b -> b | None -> c_bg);
-          foreground = Some line.fg }
-        line.text)
+  let start = max 0 (total - content_h - state.scroll_offset) in
+  let visible = List.filteri (fun i _ -> i >= start && i < start + content_h) all_lines in
+  let rows = List.map (fun line ->
+    let attr = Notty.A.(fg line.fg ++ bg (match line.bg with Some b -> b | None -> c_bg)) in
+    mk_row ~attr w (" " ^ line.text)
+  ) visible in
+  let content_img = match rows with
+    | [] -> bg_block w content_h
+    | _ ->
+      let img = Notty.I.vcat rows in
+      let used = Notty.I.height img in
+      if used < content_h then
+        img <-> bg_block w (content_h - used)
+      else img in
+  (title_row <-> content_img) |> fun img ->
+    (* Crop to exactly h rows *)
+    if Notty.I.height img > h then Notty.I.vcrop 0 (Notty.I.height img - h) img
+    else if Notty.I.height img < h then img <-> bg_block w (h - Notty.I.height img)
+    else img |> fun final ->
+      final </> Notty.I.char base_attr ' ' w h
 
-let draw_diff ctx state =
-  let size = LTerm_draw.size ctx in
-  LTerm_draw.fill_style ctx
-    LTerm_style.{ none with background = Some c_bg; foreground = Some c_fg };
-  draw_str ctx 0 0
-    ~style:LTerm_style.{ none with background = Some c_status_bg;
-                                    foreground = Some c_highlight; bold = Some true }
-    (Printf.sprintf " Diff %s" (String.make (max 0 (size.cols - 6)) ' '));
+(* Render the diff pane *)
+let render_diff state w h =
+  let base_attr = Notty.A.(fg c_fg ++ bg c_bg) in
+  let title_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
+  let title_row = mk_row ~attr:title_attr w (Printf.sprintf " Diff %s" (String.make (max 0 (w - 6)) ' ')) in
+  let content_h = max 0 (h - 1) in
   if state.diff_text = "" then
-    draw_str ctx 2 2
-      ~style:LTerm_style.{ none with background = Some c_bg; foreground = Some c_border }
-      "(no diff)"
+    let empty_msg = mk_row ~attr:Notty.A.(fg c_border ++ bg c_bg) w "  (no diff)" in
+    let fill = bg_block w (max 0 (content_h - 1)) in
+    (title_row <-> empty_msg <-> fill)
+    |> fun img -> img </> Notty.I.char base_attr ' ' w h
   else begin
     let lines = String.split_on_char '\n' state.diff_text in
-    let vh = max 0 (size.rows - 1) in
+    let vh = content_h in
     let total = List.length lines in
     let start = max 0 (total - vh - state.diff_scroll) in
-    List.filteri (fun i _ -> i >= start && i < start + vh) lines
-    |> List.iteri (fun i line ->
-      let row = 1 + i in
-      if row < size.rows then
-        let fg, bg = if String.length line > 0 then match line.[0] with
-          | '+' -> (c_diff_add_fg, c_diff_add_bg)
-          | '-' -> (c_diff_del_fg, c_diff_del_bg)
-          | '@' -> (c_tool_name, c_bg)
-          | _ -> (c_fg, c_bg)
-        else (c_fg, c_bg) in
-        draw_str ctx row 1
-          ~style:LTerm_style.{ none with background = Some bg; foreground = Some fg }
-          line)
+    let visible = List.filteri (fun i _ -> i >= start && i < start + vh) lines in
+    let rows = List.map (fun line ->
+      let fg_c, bg_c = if String.length line > 0 then match line.[0] with
+        | '+' -> (c_diff_add_fg, c_diff_add_bg)
+        | '-' -> (c_diff_del_fg, c_diff_del_bg)
+        | '@' -> (c_tool_name, c_bg)
+        | _ -> (c_fg, c_bg)
+      else (c_fg, c_bg) in
+      let attr = Notty.A.(fg fg_c ++ bg bg_c) in
+      mk_row ~attr w (" " ^ line)
+    ) visible in
+    let content_img = match rows with
+      | [] -> bg_block w content_h
+      | _ ->
+        let img = Notty.I.vcat rows in
+        let used = Notty.I.height img in
+        if used < content_h then
+          img <-> bg_block w (content_h - used)
+        else img in
+    (title_row <-> content_img)
+    |> fun img -> img </> Notty.I.char base_attr ' ' w h
   end
 
-(* ---------- Git mode drawing ---------- *)
+(* ---------- Git mode rendering ---------- *)
 
-let draw_git_panel ctx ~row_start ~height ~title ~focused ~items ~sel_idx ~width =
-  if height <= 0 then 0
+let render_git_panel ~height ~title ~focused ~items ~sel_idx ~width =
+  if height <= 0 then Notty.I.empty
   else begin
     let hdr_bg = if focused then c_highlight else c_status_bg in
     let hdr_fg = if focused then c_bg else c_highlight in
-    draw_str ctx row_start 0
-      ~style:LTerm_style.{ none with background = Some hdr_bg;
-                                      foreground = Some hdr_fg; bold = Some true }
-      (Printf.sprintf " %s %s" title (String.make (max 0 (width - String.length title - 2)) ' '));
+    let hdr_attr = Notty.A.(fg hdr_fg ++ bg hdr_bg ++ st bold) in
+    let hdr_text = Printf.sprintf " %s %s" title
+        (String.make (max 0 (width - String.length title - 2)) ' ') in
+    let hdr_row = mk_row ~attr:hdr_attr width hdr_text in
     let content_h = max 0 (height - 1) in
-    let _n = List.length items in
     let scroll = max 0 (sel_idx - content_h + 1) in
-    List.iteri (fun i (label, is_current, is_dim) ->
+    let rows = List.mapi (fun i (label, is_current, is_dim) ->
       let vi = i - scroll in
       if vi >= 0 && vi < content_h then begin
-        let row = row_start + 1 + vi in
         let selected = focused && i = sel_idx in
-        let fg = if selected then c_highlight
-                 else if is_dim then c_separator  (* no data *)
-                 else if is_current then c_user    (* human edited *)
-                 else c_fg in                      (* claude only *)
-        let bg = if selected then c_status_bg else c_bg in
+        let fg_c = if selected then c_highlight
+                 else if is_dim then c_separator
+                 else if is_current then c_user
+                 else c_fg in
+        let bg_c = if selected then c_status_bg else c_bg in
         let label_trunc = if String.length label > width - 1
           then String.sub label 0 (width - 1) else label in
-        draw_str ctx row 0
-          ~style:LTerm_style.{ none with foreground = Some fg; background = Some bg;
-                                          bold = Some selected }
-          label_trunc
-      end
-    ) items;
-    height
+        let attr = Notty.A.(fg fg_c ++ bg bg_c ++ (if selected then st bold else empty)) in
+        Some (mk_row ~attr width label_trunc)
+      end else None
+    ) items in
+    let visible_rows = List.filter_map Fun.id rows in
+    let content_img = match visible_rows with
+      | [] -> bg_block width content_h
+      | _ ->
+        let img = Notty.I.vcat visible_rows in
+        let used = Notty.I.height img in
+        if used < content_h then
+          img <-> bg_block width (content_h - used)
+        else img in
+    hdr_row <-> content_img
   end
 
 let commit_has_links g sha =
@@ -917,19 +1006,18 @@ let prev_linked_file g from =
       | _ -> find (i - 1)
   in find (from - 1)
 
-let draw_git_left_panels ctx state =
-  let size = LTerm_draw.size ctx in
+let render_git_left_panels state w h =
   let g = state.git in
-  let total_h = size.rows in
-  let width = size.cols in
+  let total_h = h in
+  let width = w in
   let branch_items = List.map (fun b ->
     let prefix = if b = g.current_branch then "* " else "  " in
     (prefix ^ b, b = g.current_branch, false)
   ) g.branches in
   let commit_items = List.map (fun (sha, _ts, msg) ->
     let short_sha = if String.length sha >= 7 then String.sub sha 0 7 else sha in
-    let w = max 1 (width - 10) in
-    let msg_trunc = if String.length msg > w then String.sub msg 0 w else msg in
+    let w' = max 1 (width - 10) in
+    let msg_trunc = if String.length msg > w' then String.sub msg 0 w' else msg in
     let has_links = Hashtbl.fold (fun (s, _) _ found ->
       found || s = sha) g.git_links false in
     (Printf.sprintf " %s %s" short_sha msg_trunc, false, not has_links)
@@ -940,7 +1028,6 @@ let draw_git_left_panels ctx state =
     let fb = Filename.basename f in
     let has_links = Hashtbl.mem g.git_links (cur_sha, fb) in
     let has_human = Hashtbl.mem g.human_edits (cur_sha, fb) in
-    (* no Claude links = human edit; has_human = Claude + human mixed *)
     let is_human = not has_links || has_human in
     ("  " ^ f, is_human, false)
   ) g.files in
@@ -986,25 +1073,23 @@ let draw_git_left_panels ctx state =
     let diff = total_h - sum_h in
     List.mapi (fun i h -> if i = focused_idx then h + diff else h) heights
   else heights in
-  let row = ref 0 in
-  List.iteri (fun i (title, focused, items, sel_idx) ->
-    let h = List.nth heights i in
-    let _ = draw_git_panel ctx ~row_start:!row ~height:h ~title ~focused
-              ~items ~sel_idx ~width in
-    row := !row + h
-  ) panels
+  let panel_images = List.mapi (fun i (title, focused, items, sel_idx) ->
+    let panel_h = List.nth heights i in
+    render_git_panel ~height:panel_h ~title ~focused
+      ~items ~sel_idx ~width
+  ) panels in
+  Notty.I.vcat panel_images
 
-let draw_git_diff ctx state =
-  let size = LTerm_draw.size ctx in
+let render_git_diff state w h =
   let g = state.git in
   let header = match g.file_diff_filter with
     | Some f -> Printf.sprintf " Diff: %s " f
     | None -> " Diff " in
-  draw_str ctx 0 0
-    ~style:LTerm_style.{ none with background = Some c_status_bg;
-                                    foreground = Some c_highlight; bold = Some true }
+  let title_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
+  let title_row = mk_row ~attr:title_attr w
     (Printf.sprintf "%s%s" header
-       (String.make (max 0 (size.cols - String.length header)) ' '));
+       (String.make (max 0 (w - String.length header)) ' ')) in
+  let content_h = max 0 (h - 1) in
   let diff_text = match g.file_diff_filter with
     | None -> g.diff_preview
     | Some file ->
@@ -1045,7 +1130,7 @@ let draw_git_diff ctx state =
         (match parse_hunk line with
          | Some (o, n) -> old_ln := o; new_ln := n
          | None -> ());
-        (line, LTerm_style.cyan, c_bg)
+        (line, Notty.A.cyan, c_bg)
       | '+' ->
         let prefix = Printf.sprintf "%4d " !new_ln in
         new_ln := !new_ln + 1;
@@ -1060,167 +1145,141 @@ let draw_git_diff ctx state =
         (prefix ^ line, c_fg, c_bg)
     else ("", c_fg, c_bg)
   ) lines in
-  let vh = max 0 (size.rows - 1) in
   let scroll = g.diff_scroll_git in
-  let visible = List.filteri (fun i _ -> i >= scroll && i < scroll + vh) numbered in
-  List.iteri (fun vi (text, fg, bg) ->
-    let row = 1 + vi in
-    if row < size.rows then
-      draw_str ctx row 1
-        ~style:LTerm_style.{ none with background = Some bg; foreground = Some fg }
-        text
-  ) visible
+  let visible = List.filteri (fun i _ -> i >= scroll && i < scroll + content_h) numbered in
+  let rows = List.map (fun (text, fg_c, bg_c) ->
+    let attr = Notty.A.(fg fg_c ++ bg bg_c) in
+    mk_row ~attr w (" " ^ text)
+  ) visible in
+  let content_img = match rows with
+    | [] -> bg_block w content_h
+    | _ ->
+      let img = Notty.I.vcat rows in
+      let used = Notty.I.height img in
+      if used < content_h then
+        img <-> bg_block w (content_h - used)
+      else img in
+  title_row <-> content_img
 
-(* ---------- History mode drawing ---------- *)
+(* ---------- History mode rendering ---------- *)
 
-let draw_history_results ctx state =
-  let size = LTerm_draw.size ctx in
-  let h = state.history in
+let render_history_results state w h =
+  let hs = state.history in
   let title = Printf.sprintf " Search: \"%s\" (%d results)"
-      h.search_query (List.length h.search_results) in
-  draw_str ctx 0 0
-    ~style:LTerm_style.{ none with background = Some c_status_bg;
-                                    foreground = Some c_highlight; bold = Some true }
-    (Printf.sprintf "%s%s" title (String.make (max 0 (size.cols - String.length title)) ' '));
-  if h.search_results = [] then
-    draw_str ctx 2 2
-      ~style:LTerm_style.{ none with background = Some c_bg; foreground = Some c_border }
-      "(no results)"
+      hs.search_query (List.length hs.search_results) in
+  let title_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
+  let title_row = mk_row ~attr:title_attr w
+    (Printf.sprintf "%s%s" title (String.make (max 0 (w - String.length title)) ' ')) in
+  let content_h = max 0 (h - 1) in
+  if hs.search_results = [] then
+    let empty_msg = mk_row ~attr:Notty.A.(fg c_border ++ bg c_bg) w "  (no results)" in
+    let fill = bg_block w (max 0 (content_h - 1)) in
+    (title_row <-> empty_msg <-> fill)
   else begin
-    let row = ref 1 in
+    let rows = ref [] in
     List.iteri (fun i (session_id, user_text, _doc, _idx, _ts, distance) ->
-      if !row < size.rows - 1 then begin
-        let selected = i = h.result_idx in
+      if List.length !rows < content_h then begin
+        let selected = i = hs.result_idx in
         let marker = if selected then ">" else " " in
-        let fg = if selected then c_highlight else c_fg in
-        let bg = if selected then c_selection_bg else c_bg in
+        let fg_c = if selected then c_highlight else c_fg in
+        let bg_c = if selected then c_selection_bg else c_bg in
         let label = if user_text = "" then "(no text)" else
-          let max_len = size.cols - 14 in
+          let max_len = w - 14 in
           if String.length user_text > max_len
           then String.sub user_text 0 max_len ^ "..."
           else user_text in
         let dist = Printf.sprintf "(%.2f)" distance in
         let line1 = Printf.sprintf " %s %s  %s" marker label dist in
-        draw_str ctx !row 0
-          ~style:LTerm_style.{ none with foreground = Some fg; background = Some bg;
-                                          bold = Some selected }
-          (if String.length line1 > size.cols then String.sub line1 0 size.cols
-           else line1);
-        incr row;
-        if !row < size.rows - 1 then begin
+        let line1 = if String.length line1 > w then String.sub line1 0 w else line1 in
+        let attr1 = Notty.A.(fg fg_c ++ bg bg_c ++ (if selected then st bold else empty)) in
+        rows := mk_row ~attr:attr1 w line1 :: !rows;
+        if List.length !rows < content_h then begin
           let sid = if String.length session_id > 8
             then String.sub session_id 0 8 else session_id in
           let line2 = Printf.sprintf "   session: %s" sid in
-          draw_str ctx !row 0
-            ~style:LTerm_style.{ none with foreground = Some c_border;
-                                            background = Some bg }
-            (if String.length line2 > size.cols then String.sub line2 0 size.cols
-             else line2);
-          incr row
+          let line2 = if String.length line2 > w then String.sub line2 0 w else line2 in
+          let attr2 = Notty.A.(fg c_border ++ bg bg_c) in
+          rows := mk_row ~attr:attr2 w line2 :: !rows
         end
       end
-    ) h.search_results
+    ) hs.search_results;
+    let content_img = match List.rev !rows with
+      | [] -> bg_block w content_h
+      | rs ->
+        let img = Notty.I.vcat rs in
+        let used = Notty.I.height img in
+        if used < content_h then
+          img <-> bg_block w (content_h - used)
+        else img in
+    title_row <-> content_img
   end
 
-let draw_history_content ctx state =
-  let size = LTerm_draw.size ctx in
-  let h = state.history in
-  if h.showing_results then
-    draw_history_results ctx state
-  else if h.search_active then begin
+let render_history_content state w h =
+  let hs = state.history in
+  if hs.showing_results then
+    render_history_results state w h
+  else if hs.search_active then begin
     (* Show search input *)
     let title = " Search history" in
-    draw_str ctx 0 0
-      ~style:LTerm_style.{ none with background = Some c_status_bg;
-                                      foreground = Some c_highlight; bold = Some true }
-      (Printf.sprintf "%s%s" title (String.make (max 0 (size.cols - String.length title)) ' '));
-    let prompt = Printf.sprintf " > %s_" h.search_query in
-    draw_str ctx 2 0
-      ~style:LTerm_style.{ none with foreground = Some c_highlight; background = Some c_bg }
-      prompt
+    let title_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
+    let title_row = mk_row ~attr:title_attr w
+      (Printf.sprintf "%s%s" title (String.make (max 0 (w - String.length title)) ' ')) in
+    let content_h = max 0 (h - 1) in
+    let prompt = Printf.sprintf " > %s_" hs.search_query in
+    let prompt_attr = Notty.A.(fg c_highlight ++ bg c_bg) in
+    let prompt_row = mk_row ~attr:prompt_attr w prompt in
+    let gap = bg_block w 1 in  (* blank row before prompt *)
+    let fill = bg_block w (max 0 (content_h - 2)) in
+    title_row <-> gap <-> prompt_row <-> fill
   end else begin
-    let n_turns = List.length h.turns in
-    let n_sessions = List.length h.sessions in
+    let n_turns = List.length hs.turns in
+    let n_sessions = List.length hs.sessions in
     let title = if n_sessions = 0 then " History (no sessions)"
       else
-        let sid = match List.nth_opt h.sessions h.session_idx with
+        let sid = match List.nth_opt hs.sessions hs.session_idx with
           | Some path -> Filename.basename path |> Filename.chop_extension
           | None -> "?" in
         let short_id = if String.length sid > 8 then String.sub sid 0 8 else sid in
-        let result_info = if h.search_results <> [] && not h.showing_results then
+        let result_info = if hs.search_results <> [] && not hs.showing_results then
           Printf.sprintf "  [result %d/%d, b=list, S-arrows=jump]"
-            (h.result_idx + 1) (List.length h.search_results)
+            (hs.result_idx + 1) (List.length hs.search_results)
         else "" in
         Printf.sprintf " Session %s  Turn %d/%d  (session %d/%d)%s"
-          short_id (h.turn_idx + 1) n_turns (h.session_idx + 1) n_sessions result_info in
-    draw_str ctx 0 0
-      ~style:LTerm_style.{ none with background = Some c_status_bg;
-                                      foreground = Some c_highlight; bold = Some true }
-      (Printf.sprintf "%s%s" title (String.make (max 0 (size.cols - String.length title)) ' '));
-    let current_turn = List.nth_opt h.turns h.turn_idx in
+          short_id (hs.turn_idx + 1) n_turns (hs.session_idx + 1) n_sessions result_info in
+    let title_attr = Notty.A.(fg c_highlight ++ bg c_status_bg ++ st bold) in
+    let title_row = mk_row ~attr:title_attr w
+      (Printf.sprintf "%s%s" title (String.make (max 0 (w - String.length title)) ' ')) in
+    let content_h = max 0 (h - 1) in
+    let current_turn = List.nth_opt hs.turns hs.turn_idx in
     match current_turn with
     | None | Some [] ->
-      draw_str ctx 2 2
-        ~style:LTerm_style.{ none with background = Some c_bg; foreground = Some c_border }
-        "(no conversation loaded)"
+      let empty_msg = mk_row ~attr:Notty.A.(fg c_border ++ bg c_bg) w "  (no conversation loaded)" in
+      let fill = bg_block w (max 0 (content_h - 1)) in
+      (title_row <-> empty_msg <-> fill)
     | Some entries ->
-      let width = max 1 (size.cols - 2) in
-      let visible_entries = List.filteri (fun i _ -> i >= h.hist_scroll) entries in
+      let entry_width = max 1 (w - 2) in
+      let visible_entries = List.filteri (fun i _ -> i >= hs.hist_scroll) entries in
       let all_lines =
-        List.concat_map (render_entry ~width ~verbose:true) visible_entries in
-      let visible = max 0 (size.rows - 1) in
-      List.filteri (fun i _ -> i < visible) all_lines
-      |> List.iteri (fun i line ->
-        let row = 1 + i in
-        if row < size.rows then
-          draw_str ctx row 1
-            ~style:LTerm_style.{ none with
-              background = Some (match line.bg with Some b -> b | None -> c_bg);
-              foreground = Some line.fg }
-            line.text)
+        List.concat_map (render_entry ~width:entry_width ~verbose:true) visible_entries in
+      let visible = List.filteri (fun i _ -> i < content_h) all_lines in
+      let rows = List.map (fun line ->
+        let attr = Notty.A.(fg line.fg ++ bg (match line.bg with Some b -> b | None -> c_bg)) in
+        mk_row ~attr w (" " ^ line.text)
+      ) visible in
+      let content_img = match rows with
+        | [] -> bg_block w content_h
+        | _ ->
+          let img = Notty.I.vcat rows in
+          let used = Notty.I.height img in
+          if used < content_h then
+            img <-> bg_block w (content_h - used)
+          else img in
+      title_row <-> content_img
   end
 
-(* ---------- Main draw ---------- *)
-
-let draw_status_bar ctx size state =
-  let sbg = LTerm_style.{ none with background = Some c_status_bg; foreground = Some c_fg } in
-  draw_str ctx 0 0 ~style:sbg (String.make size.LTerm_geom.cols ' ');
-  let mode_tag = match state.mode with
-    | Conv -> "CONV" | Git -> "GIT" | History -> "HIST" in
-  let model = if state.status_model = "" then "urme" else state.status_model in
-  let ctx_str =
-    if state.context_tokens > 0 then
-      Printf.sprintf " %dk/200k" (state.context_tokens / 1000)
-    else "" in
-  let left = Printf.sprintf " [%s] %s%s" mode_tag model ctx_str in
-  draw_str ctx 0 0
-    ~style:LTerm_style.{ none with background = Some c_status_bg;
-                                    foreground = Some c_highlight; bold = Some true }
-    left;
-  draw_str ctx 0
-    (max (String.length left + 2)
-       ((size.cols - String.length state.status_extra) / 2))
-    ~style:sbg state.status_extra;
-  let right_str = match state.config.plan, state.usage with
-    | (Urme_core.Config.Pro | Urme_core.Config.Max), Some u ->
-      let usage_str = Urme_core.Usage.format_status_bar u in
-      if state.status_tokens_in > 0 || state.status_tokens_out > 0 then
-        Printf.sprintf "%dk in / %dk out | %s"
-          (state.status_tokens_in / 1000) (state.status_tokens_out / 1000)
-          usage_str
-      else usage_str
-    | _ ->
-      if state.status_tokens_in > 0 || state.status_tokens_out > 0 then
-        Printf.sprintf "%dk in / %dk out | $%.4f"
-          (state.status_tokens_in / 1000) (state.status_tokens_out / 1000)
-          state.status_cost
-      else ""
-  in
-  if right_str <> "" then
-    draw_str ctx 0 (max 0 (size.cols - String.length right_str - 1)) ~style:sbg right_str
-
-let draw_input_line ctx input_row size state =
-  let ist = LTerm_style.{ none with background = Some c_input_bg; foreground = Some c_fg } in
+(* Render the input line (1 row) *)
+let render_input_line state w =
+  let ist = Notty.A.(fg c_fg ++ bg c_input_bg) in
   let prompt = match state.mode with
     | Conv -> (match state.pending with
       | Some p ->
@@ -1242,98 +1301,96 @@ let draw_input_line ctx input_row size state =
         " <-/->step  S-<-/S->=prev/next result  b=back to list  /=search  q=exit "
       else
         " <-/->step  /=search  i=index  Up/Down=scroll  q=exit " in
-  draw_str ctx input_row 0 ~style:ist
-    (Printf.sprintf "%s%s%s" prompt state.input_text
-       (String.make (max 0 (size.LTerm_geom.cols - String.length state.input_text
-                            - String.length prompt)) ' '))
+  let text = Printf.sprintf "%s%s" prompt state.input_text in
+  let pad_len = max 0 (w - String.length text) in
+  let full_text = text ^ String.make pad_len ' ' in
+  mk_row ~attr:ist w full_text
 
-let draw_palette ctx input_row size state =
-  if state.palette_open then begin
+(* Render the command palette overlay *)
+let render_palette state w h input_row =
+  if not state.palette_open then Notty.I.void w h
+  else begin
     let candidates = filter_commands state.input_text in
     let n = List.length candidates in
-    if n > 0 then begin
+    if n = 0 then Notty.I.void w h
+    else begin
       let max_show = min n 6 in
-      let box_width = min (size.LTerm_geom.cols - 2) 50 in
+      let box_width = min (w - 2) 50 in
       let box_top = max 1 (input_row - max_show) in
-      let sel_bg = LTerm_style.rgb 50 50 90 in
-      let norm_bg = LTerm_style.rgb 35 35 60 in
-      let sel_style = LTerm_style.{ none with background = Some sel_bg;
-                                               foreground = Some c_highlight;
-                                               bold = Some true } in
-      let norm_style = LTerm_style.{ none with background = Some norm_bg;
-                                                foreground = Some c_fg } in
+      let sel_bg_c = Notty.A.rgb_888 ~r:50 ~g:50 ~b:90 in
+      let norm_bg_c = Notty.A.rgb_888 ~r:35 ~g:35 ~b:60 in
+      let sel_attr = Notty.A.(fg c_highlight ++ bg sel_bg_c ++ st bold) in
+      let norm_attr = Notty.A.(fg c_fg ++ bg norm_bg_c) in
       let sel = state.palette_selected mod n in
       let scroll_off =
         if sel < max_show then 0
         else sel - max_show + 1 in
-      List.iteri (fun i c ->
+      let rows = List.mapi (fun i c ->
         let vi = i - scroll_off in
         if vi >= 0 && vi < max_show then begin
-          let row = box_top + vi in
           let selected = i = sel in
-          let style = if selected then sel_style else norm_style in
+          let attr = if selected then sel_attr else norm_attr in
           let label = Printf.sprintf " %-12s %s" c.cmd c.description in
           let label = if String.length label >= box_width
             then String.sub label 0 (box_width - 1) else label in
           let padded = label ^ String.make (max 0 (box_width - String.length label)) ' ' in
-          draw_str ctx row 1 ~style padded
-        end
-      ) candidates
+          Some (mk_row ~attr box_width padded)
+        end else None
+      ) candidates in
+      let visible_rows = List.filter_map Fun.id rows in
+      match visible_rows with
+      | [] -> Notty.I.void w h
+      | _ ->
+        let palette_img = Notty.I.vcat visible_rows in
+        (* Position: pad top by box_top rows, left by 1 col *)
+        Notty.I.pad ~l:1 ~t:box_top palette_img
     end
   end
 
-let draw mvar ui matrix =
-  match peek mvar with
-  | None -> ()
-  | Some state ->
-    let size = LTerm_ui.size ui in
-    let ctx = LTerm_draw.context matrix size in
-    LTerm_draw.clear ctx;
-    LTerm_draw.fill_style ctx LTerm_style.{ none with background = Some c_bg };
-    let input_row = size.rows - 1 in
-    let pane_height = max 1 (size.rows - 2) in
-    (* Shared: status bar *)
-    draw_status_bar ctx size state;
-    (* Mode-specific content *)
-    (match state.mode with
-     | Conv ->
-       if pane_height > 0 then
-         draw_conversation
-           (LTerm_draw.sub ctx LTerm_geom.{ row1=1; col1=0; row2=1+pane_height; col2=size.cols })
-           state
-     | Git ->
-       let left_w = max 1 (size.cols / 4) in
-       let bs = LTerm_style.{ none with background = Some c_bg; foreground = Some c_border } in
-       if left_w > 0 && pane_height > 0 then
-         draw_git_left_panels
-           (LTerm_draw.sub ctx { row1=1; col1=0; row2=1+pane_height; col2=left_w })
-           state;
-       if left_w > 0 && left_w < size.cols then
-         for row = 1 to pane_height do draw_str ctx row left_w ~style:bs "\xe2\x94\x82" done;
-       if size.cols > left_w + 1 && pane_height > 0 then
-         draw_git_diff
-           (LTerm_draw.sub ctx { row1=1; col1=left_w+1; row2=1+pane_height; col2=size.cols })
-           state
-     | History ->
-       if pane_height > 0 then
-         draw_history_content
-           (LTerm_draw.sub ctx LTerm_geom.{ row1=1; col1=0; row2=1+pane_height; col2=size.cols })
-           state);
-    (* Shared: input line *)
-    draw_input_line ctx input_row size state;
-    (match state.mode with
-     | Conv ->
-       LTerm_ui.set_cursor_visible ui true;
-       LTerm_ui.set_cursor_position ui
-         LTerm_geom.{ row = input_row;
-                      col = (let prompt_len = match state.pending with
-                        | Some p -> String.length (Printf.sprintf "[Y/N] Allow %s: %s? " p.tool_name
-                            (summarize_tool_input p.tool_name p.tool_input))
-                        | None -> if state.streaming then 3 else 2 in
-                      prompt_len + String.length state.input_text) }
-     | _ -> LTerm_ui.set_cursor_visible ui false);
-    (* Shared: palette overlay *)
-    draw_palette ctx input_row size state
+(* Main compose function: build the full screen image *)
+let render_screen state w h =
+  let status = render_status_bar state w in
+  let input_row = h - 1 in
+  let pane_height = max 1 (h - 2) in
+  let content = match state.mode with
+    | Conv -> render_conversation state w pane_height
+    | Git ->
+      let left_w = max 1 (w / 4) in
+      let right_w = max 1 (w - left_w - 1) in
+      let left = render_git_left_panels state left_w pane_height in
+      let sep_attr = Notty.A.(fg c_border ++ bg c_bg) in
+      let sep = Notty.I.vcat (List.init pane_height (fun _ ->
+        Notty.I.string sep_attr "\xe2\x94\x82")) in
+      let right = render_git_diff state right_w pane_height in
+      left <|> sep <|> right
+    | History -> render_history_content state w pane_height in
+  let input = render_input_line state w in
+  let base = status <-> content <-> input in
+  let palette = render_palette state w h input_row in
+  base </> palette
+
+(* Now wire up the real redraw *)
+let () =
+  redraw_ref := fun mvar ->
+    match !term_ref, peek mvar with
+    | Some term, Some state ->
+      let (w, h) = Notty_lwt.Term.size term in
+      let img = render_screen state w h in
+      Lwt.async (fun () ->
+        Lwt.catch (fun () ->
+          let open Lwt.Syntax in
+          let* () = Notty_lwt.Term.image term img in
+          (* Cursor *)
+          (match state.mode with
+           | Conv ->
+             let prompt_len = match state.pending with
+               | Some p -> String.length (Printf.sprintf "[Y/N] Allow %s: %s? " p.tool_name
+                   (summarize_tool_input p.tool_name p.tool_input))
+               | None -> if state.streaming then 3 else 2 in
+             Notty_lwt.Term.cursor term (Some (prompt_len + String.length state.input_text, h - 1))
+           | _ -> Notty_lwt.Term.cursor term None)
+        ) (fun _ -> Lwt.return_unit))
+    | _ -> ()
 
 (* ---------- Daemon ---------- *)
 
@@ -1355,7 +1412,7 @@ let ensure_daemon mvar =
     let* () = Lwt_mvar.put mvar { s with daemon = Some d } in
     Lwt.return d
 
-(* ---------- Commit-centric git ↔ conversation link index ---------- *)
+(* ---------- Commit-centric git <-> conversation link index ---------- *)
 
 let log_debug msg =
   let oc = open_out_gen [Open_append; Open_creat] 0o644 "/tmp/urme_debug.log" in
@@ -1940,6 +1997,8 @@ let handle_command mvar cmd =
        \  Tab          Switch pane focus\n\
        \  Up/Down      Scroll active pane\n\
        \  Ctrl-V       Toggle thinking blocks\n\
+       \  Alt-G        Git mode\n\
+       \  Alt-H        History mode\n\
        \  Ctrl-C       Quit" in
     let* () = update mvar (fun s ->
       { s with entries = System_info help :: s.entries }) in
@@ -2215,7 +2274,8 @@ let run ~config ~project_dir () =
     then Filename.concat (Sys.getcwd ()) project_dir
     else project_dir in
   let mvar = Lwt_mvar.create (initial_state ~config ~project_dir) in
-  let* term = Lazy.force LTerm.stdout in
+  let term = Notty_lwt.Term.create ~mouse:false ~nosig:true () in
+  term_ref := Some term;
 
   (* Permission server *)
   let* perm_server = Permission_server.start ~on_request:(fun req ->
@@ -2241,8 +2301,8 @@ let run ~config ~project_dir () =
   ) () in
   let* () = update mvar (fun s -> { s with perm_server = Some perm_server }) in
 
-  let* ui = LTerm_ui.create term (draw mvar) in
-  let* () = update mvar (fun s -> { s with ui = Some ui }) in
+  (* Initial render *)
+  redraw mvar;
 
   (* Initial usage fetch for Pro/Max plans *)
   (match config.plan with
@@ -2254,8 +2314,6 @@ let run ~config ~project_dir () =
     | Some p -> p.resolve allow; redraw mvar; Lwt.return_unit
     | None -> Lwt.return_unit
   in
-
-  let is_char c ch = Uchar.to_int c = Uchar.to_int (Uchar.of_char ch) in
 
   let do_quit () =
     let s = match peek mvar with Some s -> s | None -> initial_state ~config ~project_dir in
@@ -2270,8 +2328,8 @@ let run ~config ~project_dir () =
       ignore (Sys.command "pkill -TERM -f 'chroma run' 2>/dev/null");
     if s.started_ollama then
       ignore (Sys.command "pkill -TERM -x ollama 2>/dev/null");
-    (* Quit UI, then hard-exit to skip at_exit handlers that hit stale FDs *)
-    (try Lwt.ignore_result (LTerm_ui.quit ui) with _ -> ());
+    (* Quit terminal, then hard-exit to skip at_exit handlers that hit stale FDs *)
+    (try Lwt.ignore_result (Notty_lwt.Term.release term) with _ -> ());
     Unix._exit 0
   in
 
@@ -2377,41 +2435,37 @@ let run ~config ~project_dir () =
     | None -> s
   in
 
+  let events = Notty_lwt.Term.events term in
+
   let rec loop () =
-    let* event = LTerm_ui.wait ui in
+    let* event = Lwt_stream.next events in
     match event with
-    | LTerm_event.Key { code = LTerm_key.Char c; control = true; _ }
-      when is_char c 'c' || is_char c 'd' ->
+    | `Key (`ASCII c, mods) when (c = 'C' || c = 'D') && List.mem `Ctrl mods ->
       do_quit ()
 
-    | LTerm_event.Key { code = LTerm_key.Char c; control = true; _ }
-      when is_char c 'v' ->
+    | `Key (`ASCII c, mods) when c = 'V' && List.mem `Ctrl mods ->
       let* () = update mvar (fun s -> { s with verbose = not s.verbose }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char c; control = true; _ }
-      when is_char c 'g' ->
+    | `Key (`ASCII 'g', mods) when List.mem `Meta mods ->
       let* () = switch_to_git mvar in loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char c; control = true; _ }
-      when is_char c 'h' ->
+    | `Key (`ASCII 'h', mods) when List.mem `Meta mods ->
       let* () = switch_to_history mvar in loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char c; control = false; meta = false; _ }
-      when (match peek mvar with Some s -> s.pending <> None | None -> false)
-        && (is_char c 'y' || is_char c 'Y') ->
+    | `Key (`ASCII c, []) when (match peek mvar with Some s -> s.pending <> None | None -> false)
+        && (c = 'y' || c = 'Y') ->
       let* () = handle_approval mvar true in loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char c; control = false; meta = false; _ }
-      when (match peek mvar with Some s -> s.pending <> None | None -> false)
-        && (is_char c 'n' || is_char c 'N') ->
+    | `Key (`ASCII c, []) when (match peek mvar with Some s -> s.pending <> None | None -> false)
+        && (c = 'n' || c = 'N') ->
       let* () = handle_approval mvar false in loop ()
 
     | _ when (match peek mvar with Some s -> s.pending <> None | None -> false) ->
       loop ()
 
     (* --- Palette open: intercept keys --- *)
-    | LTerm_event.Key { code = LTerm_key.Enter; _ }
+    | `Key (`Enter, _)
       when (match peek mvar with Some s -> s.palette_open | None -> false) ->
       let cmd = match peek mvar with
         | Some s ->
@@ -2428,13 +2482,13 @@ let run ~config ~project_dir () =
         redraw mvar; loop ()
       end
 
-    | LTerm_event.Key { code = LTerm_key.Escape; _ }
+    | `Key (`Escape, _)
       when (match peek mvar with Some s -> s.palette_open | None -> false) ->
       let* () = update mvar (fun s ->
         { s with input_text = ""; palette_open = false; palette_selected = 0 }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Up; _ }
+    | `Key (`Arrow `Up, _)
       when (match peek mvar with Some s -> s.palette_open | None -> false) ->
       let* () = update mvar (fun s ->
         let n = List.length (filter_commands s.input_text) in
@@ -2443,7 +2497,7 @@ let run ~config ~project_dir () =
         { s with palette_selected = sel }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Down; _ }
+    | `Key (`Arrow `Down, _)
       when (match peek mvar with Some s -> s.palette_open | None -> false) ->
       let* () = update mvar (fun s ->
         let n = List.length (filter_commands s.input_text) in
@@ -2452,7 +2506,7 @@ let run ~config ~project_dir () =
         { s with palette_selected = sel }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Backspace; _ }
+    | `Key (`Backspace, _)
       when (match peek mvar with Some s -> s.palette_open | None -> false) ->
       let* () = update mvar (fun s ->
         let len = String.length s.input_text in
@@ -2464,13 +2518,13 @@ let run ~config ~project_dir () =
           { s with palette_open = false; palette_selected = 0 }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char c; control = false; meta = false; _ }
+    | `Key (`ASCII c, [])
       when (match peek mvar with Some s -> s.palette_open | None -> false) ->
-      let ch = Uchar.to_int c in
+      let ch = Char.code c in
       let* () =
         if ch >= 32 && ch < 127 then
           let* () = update mvar (fun s ->
-            { s with input_text = s.input_text ^ String.make 1 (Char.chr ch);
+            { s with input_text = s.input_text ^ String.make 1 c;
                      palette_selected = 0 }) in
           (redraw mvar; Lwt.return_unit)
         else Lwt.return_unit
@@ -2478,7 +2532,7 @@ let run ~config ~project_dir () =
       loop ()
 
     (* --- Git mode keys --- *)
-    | LTerm_event.Key { code = LTerm_key.Escape; _ }
+    | `Key (`Escape, _)
       when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
       let* () = update mvar (fun s ->
         match s.git.file_diff_filter with
@@ -2490,8 +2544,9 @@ let run ~config ~project_dir () =
       redraw mvar; loop ()
 
     (* Tab: next panel *)
-    | LTerm_event.Key { code = LTerm_key.Tab; shift = false; _ }
-      when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
+    | `Key (`Tab, mods)
+      when (match peek mvar with Some s -> s.mode = Git | None -> false)
+        && not (List.mem `Shift mods) ->
       let* () = update mvar (fun s ->
         let g = s.git in
         let next = match g.focus with
@@ -2509,8 +2564,9 @@ let run ~config ~project_dir () =
       redraw mvar; loop ()
 
     (* Shift+Tab: previous panel *)
-    | LTerm_event.Key { code = LTerm_key.Tab; shift = true; _ }
-      when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
+    | `Key (`Tab, mods)
+      when (match peek mvar with Some s -> s.mode = Git | None -> false)
+        && List.mem `Shift mods ->
       let* () = update mvar (fun s ->
         let g = s.git in
         let prev = match g.focus with
@@ -2528,7 +2584,7 @@ let run ~config ~project_dir () =
       redraw mvar; loop ()
 
     (* Up / k: navigate up *)
-    | LTerm_event.Key { code = LTerm_key.Up; _ }
+    | `Key (`Arrow `Up, _)
       when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
       let* () = update mvar (fun s ->
         let g = s.git in
@@ -2540,9 +2596,8 @@ let run ~config ~project_dir () =
         { s with git }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char ch; _ }
-      when Uchar.to_int ch = Char.code 'k'
-        && (match peek mvar with Some s -> s.mode = Git | None -> false) ->
+    | `Key (`ASCII 'k', [])
+      when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
       let* () = update mvar (fun s ->
         let g = s.git in
         let git = match g.focus with
@@ -2554,7 +2609,7 @@ let run ~config ~project_dir () =
       redraw mvar; loop ()
 
     (* Down / j: navigate down *)
-    | LTerm_event.Key { code = LTerm_key.Down; _ }
+    | `Key (`Arrow `Down, _)
       when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
       let* () = update mvar (fun s ->
         let g = s.git in
@@ -2566,9 +2621,8 @@ let run ~config ~project_dir () =
         { s with git }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char ch; _ }
-      when Uchar.to_int ch = Char.code 'j'
-        && (match peek mvar with Some s -> s.mode = Git | None -> false) ->
+    | `Key (`ASCII 'j', [])
+      when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
       let* () = update mvar (fun s ->
         let g = s.git in
         let git = match g.focus with
@@ -2580,16 +2634,14 @@ let run ~config ~project_dir () =
       redraw mvar; loop ()
 
     (* [ / ]: scroll diff up/down *)
-    | LTerm_event.Key { code = LTerm_key.Char ch; _ }
-      when Uchar.to_int ch = Char.code '['
-        && (match peek mvar with Some s -> s.mode = Git | None -> false) ->
+    | `Key (`ASCII '[', [])
+      when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
       let* () = update mvar (fun s ->
         { s with git = { s.git with diff_scroll_git = max 0 (s.git.diff_scroll_git - 1) } }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char ch; _ }
-      when Uchar.to_int ch = Char.code ']'
-        && (match peek mvar with Some s -> s.mode = Git | None -> false) ->
+    | `Key (`ASCII ']', [])
+      when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
       let* () = update mvar (fun s ->
         let g = s.git in
         let n = List.length (String.split_on_char '\n' g.diff_preview) in
@@ -2597,9 +2649,8 @@ let run ~config ~project_dir () =
       redraw mvar; loop ()
 
     (* h: switch to history — if file has links, show them as a navigable list *)
-    | LTerm_event.Key { code = LTerm_key.Char ch; control = false; _ }
-      when Uchar.to_int ch = Char.code 'h'
-        && (match peek mvar with Some s -> s.mode = Git | None -> false) ->
+    | `Key (`ASCII 'h', [])
+      when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
       let has_file_links = match peek mvar with
         | Some s ->
           let g = s.git in
@@ -2645,10 +2696,8 @@ let run ~config ~project_dir () =
       end
 
     (* Enter: context-dependent activate *)
-    | LTerm_event.Key { code = LTerm_key.Enter; _ }
-      when (match peek mvar with Some s -> s.mode = Git | None ->
-        let oc = open_out_gen [Open_append;Open_creat] 0o644 "/tmp/urme_key.log" in
-        Printf.fprintf oc "Enter: peek=None (mvar taken?)\n%!"; close_out oc; false) ->
+    | `Key (`Enter, _)
+      when (match peek mvar with Some s -> s.mode = Git | None -> false) ->
       let* s = Lwt_mvar.take mvar in
       let g = s.git in
       let* () = match g.focus with
@@ -2725,11 +2774,7 @@ let run ~config ~project_dir () =
                  ~project_dir:s.project_dir in
              let path = Filename.concat jsonl_dir (link.session_id ^ ".jsonl") in
              if Sys.file_exists path then begin
-               (* Use interaction-aligned turns to match edit_extract's counting
-                  (only String user messages start turns, not tool-result text) *)
                let turns = split_into_interaction_turns ~filepath:path in
-               (* turn_idx is 1-based from edit_extract; turns list is 0-indexed *)
-               (* turn_idx is 1-based from edit_extract; turns list is 0-indexed *)
                let ti = min (max 0 (link.turn_idx - 1)) (max 0 (List.length turns - 1)) in
                let new_session_idx =
                  let target = link.session_id ^ ".jsonl" in
@@ -2738,8 +2783,6 @@ let run ~config ~project_dir () =
                    | p :: rest ->
                      if Filename.basename p = target then i else find (i + 1) rest
                  in find 0 s.history.sessions in
-               (* Find actual entry position: entry_idx counts only Edit/Write,
-                  but hist_scroll indexes all entries in the turn *)
                let scroll_pos = match List.nth_opt turns ti with
                  | Some entries ->
                    let edit_count = ref 0 in
@@ -2775,7 +2818,7 @@ let run ~config ~project_dir () =
       redraw mvar; loop ()
 
     (* --- History mode: search input active --- *)
-    | LTerm_event.Key { code = LTerm_key.Escape; _ }
+    | `Key (`Escape, _)
       when (match peek mvar with
             | Some s -> s.mode = History && s.history.search_active | _ -> false) ->
       let* () = update mvar (fun s ->
@@ -2783,7 +2826,7 @@ let run ~config ~project_dir () =
                  status_extra = "History" }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Enter; _ }
+    | `Key (`Enter, _)
       when (match peek mvar with
             | Some s -> s.mode = History && s.history.search_active | _ -> false) ->
       let query = (match peek mvar with
@@ -2797,7 +2840,7 @@ let run ~config ~project_dir () =
         redraw mvar; loop ()
       end
 
-    | LTerm_event.Key { code = LTerm_key.Backspace; _ }
+    | `Key (`Backspace, _)
       when (match peek mvar with
             | Some s -> s.mode = History && s.history.search_active | _ -> false) ->
       let* () = update mvar (fun s ->
@@ -2807,19 +2850,19 @@ let run ~config ~project_dir () =
         { s with history = { s.history with search_query = q' } }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char c; control = false; _ }
+    | `Key (`ASCII c, [])
       when (match peek mvar with
             | Some s -> s.mode = History && s.history.search_active | _ -> false) ->
-      let ch = Uchar.to_int c in
+      let ch = Char.code c in
       if ch >= 32 && ch < 127 then begin
         let* () = update mvar (fun s ->
-          let q = s.history.search_query ^ String.make 1 (Char.chr ch) in
+          let q = s.history.search_query ^ String.make 1 c in
           { s with history = { s.history with search_query = q } }) in
         redraw mvar; loop ()
       end else loop ()
 
     (* --- History mode: showing search results --- *)
-    | LTerm_event.Key { code = LTerm_key.Escape; _ }
+    | `Key (`Escape, _)
       when (match peek mvar with
             | Some s -> s.mode = History && s.history.showing_results | _ -> false) ->
       let* () = update mvar (fun s ->
@@ -2833,14 +2876,14 @@ let run ~config ~project_dir () =
                    status_extra = "History" }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Enter; _ }
+    | `Key (`Enter, _)
       when (match peek mvar with
             | Some s -> s.mode = History && s.history.showing_results | _ -> false) ->
       let* () = update mvar (fun s ->
         jump_to_result s s.history.result_idx) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Up; _ }
+    | `Key (`Arrow `Up, _)
       when (match peek mvar with
             | Some s -> s.mode = History && s.history.showing_results | _ -> false) ->
       let* () = update mvar (fun s ->
@@ -2848,7 +2891,7 @@ let run ~config ~project_dir () =
             result_idx = max 0 (s.history.result_idx - 1) } }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Down; _ }
+    | `Key (`Arrow `Down, _)
       when (match peek mvar with
             | Some s -> s.mode = History && s.history.showing_results | _ -> false) ->
       let* () = update mvar (fun s ->
@@ -2857,45 +2900,40 @@ let run ~config ~project_dir () =
             result_idx = min max_idx (s.history.result_idx + 1) } }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char c; control = false; _ }
+    | `Key (`ASCII '/', [])
       when (match peek mvar with
-            | Some s -> s.mode = History && s.history.showing_results | _ -> false)
-        && (is_char c '/') ->
+            | Some s -> s.mode = History && s.history.showing_results | _ -> false) ->
       let* () = update mvar (fun s ->
         { s with history = { s.history with search_active = true; search_query = "";
                                              showing_results = false } }) in
       redraw mvar; loop ()
 
     (* --- History mode: normal browsing --- *)
-    | LTerm_event.Key { code = LTerm_key.Escape; _ }
+    | `Key (`Escape, _)
       when (match peek mvar with Some s -> s.mode = History | None -> false) ->
       let* () = update mvar (fun s ->
         { s with mode = s.history.return_mode; status_extra = "Ready" }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char c; control = false; _ }
-      when (match peek mvar with Some s -> s.mode = History | None -> false)
-        && (is_char c 'q') ->
+    | `Key (`ASCII 'q', [])
+      when (match peek mvar with Some s -> s.mode = History | None -> false) ->
       let* () = update mvar (fun s ->
         { s with mode = s.history.return_mode; status_extra = "Ready" }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char c; control = false; _ }
-      when (match peek mvar with Some s -> s.mode = History | None -> false)
-        && (is_char c '/') ->
+    | `Key (`ASCII '/', [])
+      when (match peek mvar with Some s -> s.mode = History | None -> false) ->
       let* () = update mvar (fun s ->
         { s with history = { s.history with search_active = true; search_query = "" } }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char c; control = false; _ }
-      when (match peek mvar with Some s -> s.mode = History | None -> false)
-        && (is_char c 'i') ->
+    | `Key (`ASCII 'i', [])
+      when (match peek mvar with Some s -> s.mode = History | None -> false) ->
       let* () = index_sessions mvar in
       loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char c; control = false; _ }
-      when (match peek mvar with Some s -> s.mode = History | None -> false)
-        && (is_char c 'w') ->
+    | `Key (`ASCII 'w', [])
+      when (match peek mvar with Some s -> s.mode = History | None -> false) ->
       (* Wipe ChromaDB collections and re-index *)
       let* () = update mvar (fun s ->
         { s with status_extra = "Wiping ChromaDB..." }) in
@@ -2927,8 +2965,9 @@ let run ~config ~project_dir () =
       loop ()
 
     (* Shift+Left/Right: jump to prev/next result (search or git link) *)
-    | LTerm_event.Key { code = LTerm_key.Left; shift = true; _ }
-      when (match peek mvar with
+    | `Key (`Arrow `Left, mods)
+      when List.mem `Shift mods
+        && (match peek mvar with
             | Some s -> s.mode = History && s.history.search_results <> []
                         && not s.history.showing_results | _ -> false) ->
       let* () = update mvar (fun s ->
@@ -2937,8 +2976,9 @@ let run ~config ~project_dir () =
         else jump_to_result s ri) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Right; shift = true; _ }
-      when (match peek mvar with
+    | `Key (`Arrow `Right, mods)
+      when List.mem `Shift mods
+        && (match peek mvar with
             | Some s -> s.mode = History && s.history.search_results <> []
                         && not s.history.showing_results | _ -> false) ->
       let* () = update mvar (fun s ->
@@ -2949,11 +2989,10 @@ let run ~config ~project_dir () =
       redraw mvar; loop ()
 
     (* b: back to results list *)
-    | LTerm_event.Key { code = LTerm_key.Char c; control = false; _ }
+    | `Key (`ASCII 'b', [])
       when (match peek mvar with
             | Some s -> s.mode = History && s.history.search_results <> []
-                        && not s.history.showing_results | _ -> false)
-        && (is_char c 'b') ->
+                        && not s.history.showing_results | _ -> false) ->
       let* () = update mvar (fun s ->
         let label = if s.history.return_mode = Git then
           Printf.sprintf "%d links" (List.length s.history.search_results)
@@ -2962,7 +3001,7 @@ let run ~config ~project_dir () =
                  status_extra = label }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Left; _ }
+    | `Key (`Arrow `Left, _)
       when (match peek mvar with Some s -> s.mode = History | None -> false) ->
       let* () = update mvar (fun s ->
         let h = s.history in
@@ -2982,7 +3021,7 @@ let run ~config ~project_dir () =
           else s) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Right; _ }
+    | `Key (`Arrow `Right, _)
       when (match peek mvar with Some s -> s.mode = History | None -> false) ->
       let* () = update mvar (fun s ->
         let h = s.history in
@@ -3002,14 +3041,14 @@ let run ~config ~project_dir () =
           else s) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Up; _ }
+    | `Key (`Arrow `Up, _)
       when (match peek mvar with Some s -> s.mode = History | None -> false) ->
       let* () = update mvar (fun s ->
         { s with history = { s.history with
           hist_scroll = max 0 (s.history.hist_scroll - 1) } }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Down; _ }
+    | `Key (`Arrow `Down, _)
       when (match peek mvar with Some s -> s.mode = History | None -> false) ->
       let* () = update mvar (fun s ->
         { s with history = { s.history with
@@ -3020,7 +3059,7 @@ let run ~config ~project_dir () =
       loop ()
 
     (* --- Conv mode keys --- *)
-    | LTerm_event.Key { code = LTerm_key.Enter; _ } ->
+    | `Key (`Enter, _) ->
       let text = (match peek mvar with Some s -> s.input_text | None -> "") in
       if text = "/exit" || text = "/quit" then begin
         let* () = update mvar (fun s -> { s with input_text = "" }) in
@@ -3038,21 +3077,20 @@ let run ~config ~project_dir () =
         loop ()
       end
 
-    | LTerm_event.Key { code = LTerm_key.Backspace; _ } ->
+    | `Key (`Backspace, _) ->
       let* () = update mvar (fun s ->
         let len = String.length s.input_text in
         if len > 0 then { s with input_text = String.sub s.input_text 0 (len - 1) }
         else s) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Char c; control = false; meta = false; _ } ->
-      let ch = Uchar.to_int c in
+    | `Key (`ASCII c, []) ->
+      let ch = Char.code c in
       let* () =
         if ch >= 32 && ch < 127 then
-          let chr = Char.chr ch in
           let* () = update mvar (fun s ->
-            let text = s.input_text ^ String.make 1 chr in
-            let open_palette = s.input_text = "" && chr = '/' in
+            let text = s.input_text ^ String.make 1 c in
+            let open_palette = s.input_text = "" && c = '/' in
             { s with input_text = text;
                      palette_open = open_palette;
                      palette_selected = 0 }) in
@@ -3061,24 +3099,24 @@ let run ~config ~project_dir () =
       in
       loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Tab; _ } ->
+    | `Key (`Tab, _) ->
       let* () = update mvar (fun s -> { s with active_pane =
         match s.active_pane with `Conv -> `Diff | `Diff -> `Conv }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Up; _ } ->
+    | `Key (`Arrow `Up, _) ->
       let* () = update mvar (fun s -> match s.active_pane with
         | `Conv -> { s with scroll_offset = s.scroll_offset + 1 }
         | `Diff -> { s with diff_scroll = s.diff_scroll + 1 }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Key { code = LTerm_key.Down; _ } ->
+    | `Key (`Arrow `Down, _) ->
       let* () = update mvar (fun s -> match s.active_pane with
         | `Conv -> { s with scroll_offset = max 0 (s.scroll_offset - 1) }
         | `Diff -> { s with diff_scroll = max 0 (s.diff_scroll - 1) }) in
       redraw mvar; loop ()
 
-    | LTerm_event.Resize _ -> redraw mvar; loop ()
+    | `Resize _ -> redraw mvar; loop ()
     | _ -> loop ()
   in
   loop ()
