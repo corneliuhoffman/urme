@@ -51,8 +51,6 @@ type theme = {
 }
 
 type config = {
-  chromadb_port : int;
-  ollama_url : string;
   github_token : string option;
   claude_binary : string;
   plan : plan;
@@ -96,8 +94,6 @@ let tokyo_night = {
 }
 
 let default_config = {
-  chromadb_port = 8000;
-  ollama_url = "http://127.0.0.1:11434";
   github_token = None;
   claude_binary = "claude";
   plan = Pro;
@@ -117,9 +113,8 @@ let load () =
         try json |> member key |> to_string with _ -> default in
       let int_val key default =
         try json |> member key |> to_int with _ -> default in
+      let _ = int_val in
       {
-        chromadb_port = int_val "chromadb_port" 8000;
-        ollama_url = str "ollama_url" "http://127.0.0.1:11434";
         github_token =
           (match Sys.getenv_opt "GITHUB_TOKEN" with
            | Some t -> Some t

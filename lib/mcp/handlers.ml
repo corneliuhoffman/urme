@@ -1,37 +1,40 @@
-(* MCP tool handlers — dispatch to existing urme libraries *)
+(* MCP tool handlers — V2 SQLite + pure analysis engine. No ChromaDB.
+
+   The six tools run against .urme/db.sqlite (populated by `urme init`)
+   and use Git_link's pure analysis functions for per-edit provenance. *)
 
 open Lwt.Syntax
 open Urme_engine.Git_link_types
 
+module D = Urme_store.Db
+module Schema = Urme_store.Schema
+module Search = Urme_search.Search
+module S = Sqlite3
+
 type state = {
   project_dir : string;
-  port : int;
-  mutable collection_id : string option;
+  mutable db : S.db option;
   mutable repo : Urme_store.Project_store.Store.Repo.t option;
   mutable edits : edit list option;
   mutable branch_label : (string, string) Hashtbl.t option;
 }
 
-let create_state ~port ~project_dir =
-  let project_dir = if project_dir = "." || project_dir = "./"
-    then Sys.getcwd ()
+let create_state ~project_dir =
+  let project_dir =
+    if project_dir = "." || project_dir = "./" then Sys.getcwd ()
     else if Filename.is_relative project_dir
     then Filename.concat (Sys.getcwd ()) project_dir
-    else project_dir in
-  { project_dir; port; collection_id = None;
-    repo = None; edits = None; branch_label = None }
+    else project_dir
+  in
+  { project_dir; db = None; repo = None; edits = None; branch_label = None }
 
-(* Lazy initialization helpers *)
-
-let ensure_collection st =
-  match st.collection_id with
-  | Some id -> Lwt.return id
+let ensure_db st =
+  match st.db with
+  | Some db -> db
   | None ->
-    let project = Filename.basename st.project_dir in
-    let* id = Urme_search.Chromadb.ensure_interactions_collection
-        ~port:st.port ~project in
-    st.collection_id <- Some id;
-    Lwt.return id
+    let db = Schema.open_or_create ~project_dir:st.project_dir in
+    st.db <- Some db;
+    db
 
 let ensure_repo st =
   match st.repo with
@@ -60,7 +63,7 @@ let ensure_branch_label st =
     st.branch_label <- Some bl;
     Lwt.return bl
 
-(* Result formatters *)
+(* ---------- Result formatters ---------- *)
 
 let text_result text =
   `Assoc [
@@ -120,45 +123,100 @@ let decomposition_to_json (d : decomposition) =
     "n_edits", `Int (List.length claude_edits);
   ]
 
-(* --- Tool implementations --- *)
+let hit_to_json (h : Search.hit) =
+  `Assoc [
+    "step_id", `Int h.step_id;
+    "session_id",
+      (match h.session_id with Some s -> `String s | None -> `Null);
+    "turn_index", `Int h.turn_index;
+    "timestamp", `Float h.timestamp;
+    "summary", `String h.summary;
+    "tags", `String h.tags;
+    "prompt_text", `String h.prompt_text;
+    "files_touched", (try Yojson.Safe.from_string h.files_touched
+                      with _ -> `List []);
+    "commit_before",
+      (match h.commit_before with Some s -> `String s | None -> `Null);
+    "commit_after",
+      (match h.commit_after with Some s -> `String s | None -> `Null);
+    "score", `Float h.score;
+  ]
+
+(* Generic "row from steps" returned as JSON, shared between file_history,
+   commit_links, etc. Columns must match the SELECT we use below. *)
+let step_row_to_json cols =
+  `Assoc [
+    "step_id", `Int (D.data_to_int cols.(0));
+    "session_id",
+      (match D.data_to_string_opt cols.(1) with
+       | Some s -> `String s | None -> `Null);
+    "turn_index", `Int (D.data_to_int cols.(2));
+    "timestamp", `Float (D.data_to_float cols.(3));
+    "summary", `String (D.data_to_string cols.(4));
+    "tags", `String (D.data_to_string cols.(5));
+    "prompt_text", `String (D.data_to_string cols.(6));
+    "files_touched", (try Yojson.Safe.from_string (D.data_to_string cols.(7))
+                      with _ -> `List []);
+    "commit_before",
+      (match D.data_to_string_opt cols.(8) with
+       | Some s -> `String s | None -> `Null);
+    "commit_after",
+      (match D.data_to_string_opt cols.(9) with
+       | Some s -> `String s | None -> `Null);
+  ]
+
+let step_select_cols =
+  "s.id, s.session_id, s.turn_index, s.timestamp, \
+   COALESCE(s.summary,''), COALESCE(s.tags,''), \
+   COALESCE(s.prompt_text,''), COALESCE(s.files_touched,'[]'), \
+   s.commit_before, s.commit_after"
+
+(* ---------- Tool implementations ---------- *)
 
 let handle_search_history st args =
   let open Yojson.Safe.Util in
   let query = args |> member "query" |> to_string in
   let n = try args |> member "n" |> to_int with _ -> 5 in
-  let* collection_id = ensure_collection st in
-  let* results = Urme_search.Chromadb.search_all_interactions
-      ~port:st.port ~collection_id ~query ~n in
-  let items = List.map (fun (session_id, user_text, doc, idx, ts, dist) ->
-    `Assoc [
-      "session_id", `String session_id;
-      "user_text", `String user_text;
-      "interaction_index", `Int idx;
-      "timestamp", `String ts;
-      "distance", `Float dist;
-      "document", `String (if String.length doc > 500
-        then String.sub doc 0 500 ^ "..." else doc);
-    ]
-  ) results in
+  let db = ensure_db st in
+  let hits = Search.run_with_fallback ~db ~limit:n query in
   Lwt.return (json_result (`Assoc [
     "query", `String query;
-    "n_results", `Int (List.length items);
-    "results", `List items;
+    "n_results", `Int (List.length hits);
+    "results", `List (List.map hit_to_json hits);
   ]))
 
 let handle_file_history st args =
   let open Yojson.Safe.Util in
   let file_path = args |> member "file_path" |> to_string in
+  let basename = Filename.basename file_path in
+  let db = ensure_db st in
+  (* Step-level view: turns that touched the file, ordered by timestamp. *)
+  let sql =
+    Printf.sprintf
+      "SELECT %s FROM steps s \
+       WHERE s.files_touched LIKE ? OR s.files_touched LIKE ? \
+       ORDER BY s.timestamp ASC"
+      step_select_cols
+  in
+  let rows = D.query_list db sql
+    [S.Data.TEXT ("%\"" ^ basename ^ "\"%");
+     S.Data.TEXT ("%" ^ file_path ^ "%")]
+    ~f:step_row_to_json in
+  (* Per-edit provenance via diff_match for each commit that touched the
+     file — this is the fine-grained view the old Chroma-backed handler
+     used to return. *)
   let* edits = ensure_edits st in
   let* branch_label = ensure_branch_label st in
   let* repo = ensure_repo st in
   let* decompositions = Urme_engine.Git_link.file_history
-      ~project_dir:st.project_dir ~file_path ~edits ~branch_label ~repo in
-  let items = List.map decomposition_to_json decompositions in
+      ~project_dir:st.project_dir ~file_path
+      ~edits ~branch_label ~repo in
   Lwt.return (json_result (`Assoc [
     "file_path", `String file_path;
-    "n_commits", `Int (List.length items);
-    "commits", `List items;
+    "n_steps", `Int (List.length rows);
+    "steps", `List rows;
+    "n_commits", `Int (List.length decompositions);
+    "commits", `List (List.map decomposition_to_json decompositions);
   ]))
 
 let handle_region_blame st args =
@@ -166,114 +224,85 @@ let handle_region_blame st args =
   let file_path = args |> member "file_path" |> to_string in
   let start_line = args |> member "start_line" |> to_int in
   let end_line = args |> member "end_line" |> to_int in
-  (* Git blame *)
   let* blame_lines = Lwt.catch (fun () ->
     Urme_git.Ops.blame ~cwd:st.project_dir
       ~line_range:(start_line, end_line) ~filepath:file_path ()
   ) (fun _ -> Lwt.return []) in
   let blame_json = List.map (fun (sha, line_num, content) ->
     `Assoc [
-      "sha", `String (if String.length sha > 8 then String.sub sha 0 8 else sha);
+      "sha", `String (if String.length sha >= 8 then String.sub sha 0 8 else sha);
       "line", `Int line_num;
       "content", `String content;
     ]
   ) blame_lines in
-  (* Claude edit attribution *)
   let* edits = ensure_edits st in
   let* branch_label = ensure_branch_label st in
   let* repo = ensure_repo st in
   let* decompositions = Urme_engine.Git_link.region_history
       ~project_dir:st.project_dir ~path:file_path
       ~start_line ~end_line ~edits ~branch_label ~repo in
-  let decomp_json = List.map decomposition_to_json decompositions in
   Lwt.return (json_result (`Assoc [
     "file_path", `String file_path;
     "lines", `String (Printf.sprintf "%d-%d" start_line end_line);
     "blame", `List blame_json;
-    "claude_history", `List decomp_json;
+    "claude_history",
+      `List (List.map decomposition_to_json decompositions);
   ]))
 
+(* A commit's "explanation" = raw diff + every step whose commit_after
+   matches, ideally filtered to the file at hand. *)
 let handle_explain_change st args =
   let open Yojson.Safe.Util in
   let sha = args |> member "commit_sha" |> to_string in
   let file_path = args |> member "file_path" |> to_string in
-  let file_base = Filename.basename file_path in
-  let* edits = ensure_edits st in
-  let* branch_label = ensure_branch_label st in
-  let* repo = ensure_repo st in
-  let* d = Urme_engine.Diff_match.decompose_diff ~sha ~file:file_path
-      ~branch_label ~edits ~cwd:st.project_dir ~repo in
+  let basename = Filename.basename file_path in
   let* diff = Lwt.catch (fun () ->
     Urme_git.Ops.run_git ~cwd:st.project_dir
       ["diff"; sha ^ "^"; sha; "--"; file_path]
   ) (fun _ -> Lwt.return "") in
-  let n_claude = List.length (List.filter (fun item -> match item with
-    | DirectEdit _ -> true | _ -> false) d.items) in
-  let n_unexplained = List.length (List.filter (fun item -> match item with
-    | Unexplained _ -> true | _ -> false) d.items) in
-  (* Also include ChromaDB links for this commit+file *)
-  let* collection_id = ensure_collection st in
-  let* all_gis = Urme_search.Chromadb.get_all_with_git_info
-      ~port:st.port ~collection_id in
-  let links = List.concat_map (fun (_id, gi_str, session_id, _idx, _ts) ->
-    let tbl = parse_git_info_json gi_str in
-    Hashtbl.fold (fun ek value acc ->
-      match value with
-      | Some gi when String.length gi.commit_sha >= String.length sha &&
-                     String.sub gi.commit_sha 0 (String.length sha) = sha ->
-        let fb = match String.split_on_char ':' ek with
-          | f :: _ -> f | [] -> "" in
-        if fb = file_base then
-          `Assoc [
-            "file", `String fb;
-            "session_id", `String session_id;
-            "turn_idx", `Int gi.turn_idx;
-            "entry_idx", `Int gi.entry_idx;
-            "edit_key", `String ek;
-          ] :: acc
-        else acc
-      | _ -> acc
-    ) tbl []
-  ) all_gis in
+  let db = ensure_db st in
+  let sql =
+    Printf.sprintf
+      "SELECT %s FROM steps s \
+       WHERE (s.commit_after LIKE ? OR s.commit_before LIKE ?) \
+         AND s.files_touched LIKE ? \
+       ORDER BY s.timestamp ASC"
+      step_select_cols
+  in
+  let sha_like = sha ^ "%" in
+  let rows = D.query_list db sql
+    [S.Data.TEXT sha_like;
+     S.Data.TEXT sha_like;
+     S.Data.TEXT ("%\"" ^ basename ^ "\"%")]
+    ~f:step_row_to_json in
   Lwt.return (json_result (`Assoc [
     "commit_sha", `String sha;
     "file", `String file_path;
-    "decomposition", decomposition_to_json d;
     "diff", `String (if String.length diff > 5000
       then String.sub diff 0 5000 ^ "\n... (truncated)" else diff);
-    "summary", `String (Printf.sprintf "%d Claude edits, %d unexplained"
-      n_claude n_unexplained);
-    "links", `List links;
+    "explanatory_steps", `List rows;
+    "n_steps", `Int (List.length rows);
   ]))
 
 let handle_commit_links st args =
   let open Yojson.Safe.Util in
   let sha = args |> member "commit_sha" |> to_string in
-  let* collection_id = ensure_collection st in
-  let* all_gis = Urme_search.Chromadb.get_all_with_git_info
-      ~port:st.port ~collection_id in
-  let links = List.concat_map (fun (_id, gi_str, session_id, _idx, _ts) ->
-    let tbl = parse_git_info_json gi_str in
-    Hashtbl.fold (fun ek value acc ->
-      match value with
-      | Some gi when String.length gi.commit_sha >= String.length sha &&
-                     String.sub gi.commit_sha 0 (String.length sha) = sha ->
-        let file_base = match String.split_on_char ':' ek with
-          | fb :: _ -> fb | [] -> "" in
-        `Assoc [
-          "file", `String file_base;
-          "session_id", `String session_id;
-          "turn_idx", `Int gi.turn_idx;
-          "entry_idx", `Int gi.entry_idx;
-          "edit_key", `String ek;
-        ] :: acc
-      | _ -> acc
-    ) tbl []
-  ) all_gis in
+  let db = ensure_db st in
+  let sql =
+    Printf.sprintf
+      "SELECT %s FROM steps s \
+       WHERE s.commit_after LIKE ? OR s.commit_before LIKE ? \
+       ORDER BY s.timestamp ASC"
+      step_select_cols
+  in
+  let sha_like = sha ^ "%" in
+  let rows = D.query_list db sql
+    [S.Data.TEXT sha_like; S.Data.TEXT sha_like]
+    ~f:step_row_to_json in
   Lwt.return (json_result (`Assoc [
     "commit_sha", `String sha;
-    "n_links", `Int (List.length links);
-    "links", `List links;
+    "n_steps", `Int (List.length rows);
+    "steps", `List rows;
   ]))
 
 let handle_search_by_file st args =
@@ -281,27 +310,34 @@ let handle_search_by_file st args =
   let file_path = args |> member "file_path" |> to_string in
   let n = try args |> member "n" |> to_int with _ -> 10 in
   let basename = Filename.basename file_path in
-  let* collection_id = ensure_collection st in
-  let* results = Urme_search.Chromadb.search_all_interactions
-      ~port:st.port ~collection_id ~query:basename ~n in
-  let items = List.map (fun (session_id, user_text, doc, idx, ts, dist) ->
-    `Assoc [
-      "session_id", `String session_id;
-      "user_text", `String user_text;
-      "interaction_index", `Int idx;
-      "timestamp", `String ts;
-      "distance", `Float dist;
-      "document", `String (if String.length doc > 500
-        then String.sub doc 0 500 ^ "..." else doc);
-    ]
-  ) results in
+  let db = ensure_db st in
+  (* First pass: exact files_touched containment; then fall back to FTS5
+     which indexes the basename if it appears in summary/tags/prompt. *)
+  let sql =
+    Printf.sprintf
+      "SELECT %s FROM steps s \
+       WHERE s.files_touched LIKE ? \
+       ORDER BY s.timestamp DESC LIMIT ?"
+      step_select_cols
+  in
+  let rows = D.query_list db sql
+    [S.Data.TEXT ("%\"" ^ basename ^ "\"%");
+     S.Data.INT (Int64.of_int n)]
+    ~f:step_row_to_json in
+  let hits_json =
+    if List.length rows >= n then rows
+    else
+      let fts_hits = Search.run ~db ~limit:n basename in
+      rows @ List.map hit_to_json fts_hits
+  in
   Lwt.return (json_result (`Assoc [
     "file", `String basename;
-    "n_results", `Int (List.length items);
-    "results", `List items;
+    "n_results", `Int (List.length hits_json);
+    "results", `List hits_json;
   ]))
 
-(* Push result to TUI via Unix socket (best-effort, fire-and-forget) *)
+(* ---------- Push to TUI (unchanged) ---------- *)
+
 let send_to_tui ~project_dir ~msg =
   let socket_path = Urme_core.Paths.tui_socket_path ~project_dir in
   if not (Sys.file_exists socket_path) then Lwt.return_unit
@@ -318,18 +354,18 @@ let send_to_tui ~project_dir ~msg =
       Lwt_unix.close socket
     ) (fun _exn -> Lwt.return_unit)
 
-(* Dispatch *)
+(* ---------- Dispatch ---------- *)
 
 let dispatch st name args =
   let* result = match name with
     | "search_history" -> handle_search_history st args
-    | "file_history" -> handle_file_history st args
-    | "region_blame" -> handle_region_blame st args
+    | "file_history"   -> handle_file_history st args
+    | "region_blame"   -> handle_region_blame st args
     | "explain_change" -> handle_explain_change st args
-    | "commit_links" -> handle_commit_links st args
+    | "commit_links"   -> handle_commit_links st args
     | "search_by_file" -> handle_search_by_file st args
-    | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name)) in
-  (* Push to TUI if running *)
+    | _ -> Lwt.return (text_result (Printf.sprintf "Unknown tool: %s" name))
+  in
   let msg = `Assoc ["type", `String name; "result", result] in
   Lwt.async (fun () -> send_to_tui ~project_dir:st.project_dir ~msg);
   Lwt.return result

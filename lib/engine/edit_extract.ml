@@ -13,7 +13,7 @@ let read_lines filepath =
 let parse_json_safe line =
   try Some (Yojson.Safe.from_string line) with _ -> None
 
-let edits_of_session ~filepath =
+let edits_of_session ?(project_dir="") ~filepath () =
   let session_id = Filename.basename filepath |> Filename.chop_extension in
   let lines = read_lines filepath in
   let open Yojson.Safe.Util in
@@ -100,7 +100,16 @@ let edits_of_session ~filepath =
                   let ek = make_edit_key ~file_base ~old_string ~new_string in
                   let eidx = !edit_in_turn in
                   incr edit_in_turn;
-                  edits := { edit_key = ek; file_base; new_string; old_string;
+                  (* Compute relative path from project_dir if fp is absolute *)
+                  let file_path =
+                    let pd = project_dir ^ "/" in
+                    let pdlen = String.length pd in
+                    if String.length fp >= pdlen
+                       && String.sub fp 0 pdlen = pd
+                    then String.sub fp pdlen (String.length fp - pdlen)
+                    else fp in
+                  edits := { edit_key = ek; file_base; file_path;
+                             new_string; old_string;
                              replace_all; timestamp = ts; session_id;
                              interaction_index = !current_iidx;
                              turn_idx = !current_iidx; entry_idx = eidx;
@@ -125,7 +134,8 @@ let edits_of_sessions ~pool ~project_dir =
   let sessions = sort_by_size_desc (Urme_search.Jsonl_reader.list_sessions ~jsonl_dir) in
   Domainslib.Task.run pool (fun () ->
     let promises = List.map (fun filepath ->
-      Domainslib.Task.async pool (fun () -> edits_of_session ~filepath)
+      Domainslib.Task.async pool (fun () ->
+        edits_of_session ~project_dir ~filepath ())
     ) sessions in
     let all = List.concat_map (Domainslib.Task.await pool) promises in
     List.sort (fun a b -> Float.compare b.timestamp a.timestamp) all

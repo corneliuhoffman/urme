@@ -5,9 +5,11 @@ let project_dir =
   Arg.(value & opt string "." & info ["project-dir"; "C"] ~docv:"DIR"
          ~doc:"Project directory (must be a git repo)")
 
+(* chromadb_port was a V1 flag. V2 uses SQLite; kept as a no-op for
+   backwards compatibility with existing invocations / .mcp.json configs. *)
 let chromadb_port =
-  Arg.(value & opt int 8000 & info ["chromadb-port"] ~docv:"PORT"
-         ~doc:"ChromaDB port")
+  Arg.(value & opt int 0 & info ["chromadb-port"] ~docv:"PORT"
+         ~doc:"[deprecated, ignored] retained for backwards compatibility")
 
 (* --- Subcommand: ask --- *)
 
@@ -50,25 +52,87 @@ let search_cmd =
     Arg.(required & pos 0 (some string) None & info [] ~docv:"QUERY"
            ~doc:"Search query") in
   let n =
-    Arg.(value & opt int 5 & info ["n"] ~docv:"N"
+    Arg.(value & opt int 20 & info ["n"] ~docv:"N"
            ~doc:"Number of results") in
-  let run _query _n _project_dir _chromadb_port =
-    Printf.printf "search: not yet implemented (Phase 6)\n"
+  let smart =
+    Arg.(value & flag & info ["smart"; "s"]
+           ~doc:"Let Claude rewrite sparse queries and rerank the shortlist \
+                 (adds latency; uses Claude CLI)") in
+  let short_sha = function
+    | Some s when String.length s >= 7 -> String.sub s 0 7
+    | Some s -> s
+    | None -> "-------"
   in
-  Cmd.v (Cmd.info "search" ~doc:"Search experiences")
-    Term.(const run $ query $ n $ project_dir $ chromadb_port)
+  let print_hit (h : Urme_search.Search.hit) =
+    Printf.printf "[%s] %s  (score %.2f)\n"
+      (short_sha h.commit_after) h.summary h.score;
+    if h.prompt_text <> "" then
+      Printf.printf "    > %s\n"
+        (if String.length h.prompt_text > 100
+         then String.sub h.prompt_text 0 100 ^ "..."
+         else h.prompt_text);
+    if h.tags <> "" then Printf.printf "    tags: %s\n" h.tags;
+    print_newline ()
+  in
+  let run query n smart project_dir _chromadb_port =
+    let db = Urme_store.Schema.open_or_create ~project_dir in
+    if smart then begin
+      let config = Urme_core.Config.load () in
+      let hits, synth = Lwt_main.run
+          (Urme_search.Search.run_smart ~db
+             ~binary:config.claude_binary ~limit:n query) in
+      if synth <> "" then Printf.printf "— %s\n\n" synth;
+      List.iter print_hit hits;
+      if hits = [] then print_endline "no matches"
+    end else begin
+      let hits = Urme_search.Search.run_with_fallback ~db ~limit:n query in
+      List.iter print_hit hits;
+      if hits = [] then print_endline "no matches"
+    end;
+    Urme_store.Schema.close db
+  in
+  Cmd.v (Cmd.info "search" ~doc:"Search indexed steps by FTS5 (with --smart: Claude rewrite + rerank)")
+    Term.(const run $ query $ n $ smart $ project_dir $ chromadb_port)
 
 (* --- Subcommand: init --- *)
 
 let init_cmd =
-  let since =
-    Arg.(value & opt string "" & info ["since"] ~docv:"DATE"
-           ~doc:"Start date (ISO format)") in
-  let run _since _project_dir _chromadb_port =
-    Printf.printf "init: not yet implemented (Phase 6)\n"
+  let skip_summaries =
+    Arg.(value & flag & info ["skip-summaries"]
+           ~doc:"Index steps but skip the Claude summarisation pass") in
+  let parallel =
+    Arg.(value & opt int 3 & info ["parallel"; "j"] ~docv:"N"
+           ~doc:"Number of parallel Claude daemons for the summarisation pass \
+                 (default 3; higher = faster but more RAM)") in
+  let run skip_summaries parallel project_dir _chromadb_port =
+    let config = Urme_core.Config.load () in
+    let db = Urme_store.Schema.open_or_create ~project_dir in
+    let n = Urme_engine.Indexer.index_all_sessions ~db ~project_dir in
+    Printf.printf "indexed %d turns\n" n;
+    (* Summarisation runs FIRST: it spawns the claude CLI via
+       Unix.fork, which OCaml 5 forbids after any Domain.spawn. The
+       git linker below uses Domainslib, so we must summarise before
+       touching any multicore code. *)
+    if not skip_summaries then begin
+      Printf.printf "running Claude summarisation pass (Haiku 4.5, %d daemons)...\n%!"
+        parallel;
+      Lwt_main.run (Urme_engine.Summarise.summarise_pending
+                      ~pool_size:parallel
+                      ~binary:config.claude_binary ~db ())
+    end;
+    Printf.printf "building per-edit git links...\n%!";
+    (try Lwt_main.run (
+       let pool = Domainslib.Task.setup_pool ~num_domains:4 () in
+       let edits = Urme_engine.Edit_extract.edits_of_sessions
+           ~pool ~project_dir in
+       Domainslib.Task.teardown_pool pool;
+       Urme_engine.Git_index.update ~project_dir ~db ~edits)
+     with e -> Printf.eprintf "link error (non-fatal): %s\n%!"
+                 (Printexc.to_string e));
+    Urme_store.Schema.close db
   in
-  Cmd.v (Cmd.info "init" ~doc:"Bootstrap experience DB from git history")
-    Term.(const run $ since $ project_dir $ chromadb_port)
+  Cmd.v (Cmd.info "init" ~doc:"Index Claude sessions into urme V2 SQLite store")
+    Term.(const run $ skip_summaries $ parallel $ project_dir $ chromadb_port)
 
 (* --- Subcommand: history --- *)
 
@@ -178,11 +242,40 @@ let prune_cmd =
   Cmd.v (Cmd.info "prune" ~doc:"Remove old experiences")
     Term.(const run $ date $ project_dir $ chromadb_port)
 
+(* --- Subcommand: export --- *)
+
+let export_cmd =
+  let path =
+    Arg.(required & pos 0 (some string) None & info [] ~docv:"PATH"
+           ~doc:"Destination file for the SQLite snapshot") in
+  let run path project_dir _chromadb_port =
+    Urme_store.Export.export_project ~project_dir ~path;
+    Printf.printf "exported %s\n" path
+  in
+  Cmd.v (Cmd.info "export" ~doc:"Write a snapshot of the V2 SQLite store")
+    Term.(const run $ path $ project_dir $ chromadb_port)
+
+(* --- Subcommand: import --- *)
+
+let import_cmd =
+  let path =
+    Arg.(required & pos 0 (some string) None & info [] ~docv:"PATH"
+           ~doc:"SQLite snapshot to restore") in
+  let force =
+    Arg.(value & flag & info ["force"; "f"]
+           ~doc:"Overwrite an existing store at .urme/db.sqlite") in
+  let run path force project_dir _chromadb_port =
+    Urme_store.Export.import_project ~project_dir ~path ~force ();
+    Printf.printf "imported %s\n" path
+  in
+  Cmd.v (Cmd.info "import" ~doc:"Restore a V2 SQLite snapshot into this project")
+    Term.(const run $ path $ force $ project_dir $ chromadb_port)
+
 (* --- Subcommand: serve (MCP server) --- *)
 
 let serve_cmd =
-  let run project_dir chromadb_port =
-    Lwt_main.run (Urme_mcp.Server.run ~port:chromadb_port ~project_dir)
+  let run project_dir _chromadb_port =
+    Lwt_main.run (Urme_mcp.Server.run ~project_dir)
   in
   Cmd.v (Cmd.info "serve" ~doc:"Run MCP server over stdio (JSON-RPC 2.0)")
     Term.(const run $ project_dir $ chromadb_port)
@@ -208,5 +301,6 @@ let () =
     ask_cmd; search_cmd; init_cmd; history_cmd;
     blame_cmd; explain_cmd; save_cmd; replay_cmd;
     pr_cmd; diff_cmd; wipe_cmd; prune_cmd; serve_cmd;
+    export_cmd; import_cmd;
   ] in
   exit (Cmd.eval cmd)

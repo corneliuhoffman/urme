@@ -2,7 +2,8 @@
 
 type edit = {
   edit_key : string;          (* file_base:Digest(new_string) *)
-  file_base : string;
+  file_base : string;         (* basename only, e.g. "app.ml" *)
+  file_path : string;         (* relative path from project root, e.g. "lib/tui/app.ml" *)
   new_string : string;
   old_string : string;        (* empty for Write *)
   replace_all : bool;         (* Edit with replace_all=true *)

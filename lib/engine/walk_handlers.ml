@@ -1,5 +1,5 @@
 (* Handlers for Git_walk: bridge the pure walking algorithm to
-   real IO — Irmin for reads, ChromaDB for saves. *)
+   real IO — Irmin for file reads, SQLite [edit_links] for writes. *)
 
 open Lwt.Syntax
 open Git_link_types
@@ -14,66 +14,51 @@ let materialise ~repo ~commit ~file ~patches =
     Patch.patch ~cleanly:false acc p
   ) base patches)
 
-(* ---------- Save: write git_info to ChromaDB ---------- *)
+(* ---------- Save: write edit linkage to SQLite ---------- *)
 
-let git_info_entry_of (edit, status) =
-  match status with
-  | Git_walk.Committed sha ->
-    let dh = diff_hash_of_string (edit.old_string ^ "\x00" ^ edit.new_string) in
-    Some (edit.edit_key, Some {
-      commit_sha = sha; diff_hash = dh;
-      turn_idx = edit.turn_idx; entry_idx = edit.entry_idx;
-    })
-  | Git_walk.Dead ->
-    Some (edit.edit_key, None)
-  | Git_walk.Pending -> None
+let row_of_edit ~origin ~branch (edit : edit) ~status =
+  let commit_sha, diff_hash =
+    match (status : Git_walk.edit_status) with
+    | Committed sha ->
+      let dh = diff_hash_of_string (edit.old_string ^ "\x00" ^ edit.new_string) in
+      Some sha, dh
+    | Dead -> None, ""
+    | Pending -> None, ""
+  in
+  let session_id = match origin with
+    | Git_walk.Claude -> Some edit.session_id
+    | Git_walk.Human -> None
+  in
+  { Urme_store.Edit_links.
+    edit_key = edit.edit_key;
+    session_id;
+    turn_idx = edit.turn_idx;
+    entry_idx = edit.entry_idx;
+    file_base = edit.file_base;
+    commit_sha;
+    diff_hash;
+    origin = (match origin with Git_walk.Claude -> "claude" | Git_walk.Human -> "human");
+    branch;
+    timestamp = edit.timestamp; }
 
-let chromadb_id_of_entry (entry : Git_walk.stack_entry) =
-  match entry.origin, entry.edits with
-  | Git_walk.Claude, ((e, _) :: _) ->
-    Printf.sprintf "%s_%d" e.session_id e.interaction_index
-  | Git_walk.Human, ((e, _) :: _) ->
-    Printf.sprintf "human_%s_%s" (Filename.basename e.file_base)
-      (Digest.string (e.old_string ^ "\x00" ^ e.new_string) |> Digest.to_hex
-       |> fun s -> String.sub s 0 16)
-  | _, [] -> "empty"
-
-let save ~port ~collection_id (entry : Git_walk.stack_entry) =
-  let id = chromadb_id_of_entry entry in
-  let new_entries = List.filter_map git_info_entry_of entry.edits in
-  if new_entries = [] then Lwt.return_unit
-  else
-    let* existing_meta = Lwt.catch (fun () ->
-      Urme_search.Chromadb.get_interaction_meta ~port ~collection_id ~id
-    ) (fun _ -> Lwt.return_none) in
-    let tbl = match existing_meta with
-      | Some meta ->
-        let open Yojson.Safe.Util in
-        let gi = try meta |> member "git_info" |> to_string with _ -> "" in
-        parse_git_info_json gi
-      | None -> Hashtbl.create 8 in
-    List.iter (fun (k, v) -> Hashtbl.replace tbl k v) new_entries;
-    let* () = match entry.origin with
-      | Git_walk.Human when existing_meta = None ->
-        (match entry.edits with
-         | (e, _) :: _ ->
-           Urme_search.Chromadb.save_interaction ~port ~collection_id
-             ~experience_id:"human"
-             ~interaction_index:(Hashtbl.hash id land 0x7FFFFFFF)
-             ~user_text:(Printf.sprintf "[human edit] %s" e.file_base)
-             ~assistant_summary:""
-             ~user_uuid:id
-             ~timestamp:(Printf.sprintf "%.0f" e.timestamp)
-             ()
-         | [] -> Lwt.return_unit)
-      | _ -> Lwt.return_unit in
-    let+ _ok = Urme_search.Chromadb.update_interaction_git_info
-        ~port ~collection_id ~id
-        ~git_info:(serialize_git_info_json tbl) in ()
+(* Save a completed stack_entry: upsert one row per edit.
+   Pending edits (still unmatched after the walk) are skipped — the
+   entry wouldn't be passed to save() if any were still Pending under
+   the walker's complete() check. *)
+let save ~db (entry : Git_walk.stack_entry) =
+  List.iter (fun (edit, status) ->
+    match (status : Git_walk.edit_status) with
+    | Pending -> ()
+    | _ ->
+      let row = row_of_edit ~origin:entry.origin
+          ~branch:edit.git_branch edit ~status in
+      Urme_store.Edit_links.upsert db row
+  ) entry.edits;
+  Lwt.return_unit
 
 (* ---------- Build handlers record ---------- *)
 
-let make ~repo ~port ~collection_id : Git_walk.handlers =
+let make ~repo ~db : Git_walk.handlers =
   { materialise = (fun ~commit ~file ~patches ->
       materialise ~repo ~commit ~file ~patches);
-    save = (fun entry -> save ~port ~collection_id entry); }
+    save = (fun entry -> save ~db entry); }

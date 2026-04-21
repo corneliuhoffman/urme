@@ -68,8 +68,8 @@ let handle_message state (msg : Yojson.Safe.t) =
       ];
     ])
 
-let run ~port ~project_dir =
-  let state = Handlers.create_state ~port ~project_dir in
+let run ~project_dir =
+  let state = Handlers.create_state ~project_dir in
   let stdin = Lwt_io.stdin in
   let stdout = Lwt_io.stdout in
   let rec loop () =

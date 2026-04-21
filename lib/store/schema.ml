@@ -14,7 +14,7 @@
 module D = Db
 module S = Sqlite3
 
-let schema_version = 1
+let schema_version = 3
 
 (* Migration 1: initial schema. *)
 let migration_1 = [
@@ -107,8 +107,49 @@ let migration_1 = [
     )|};
 ]
 
+(* Migration 2: per-edit linkage table.
+
+   One row per edit key, tracking which commit its hunk landed in (if any).
+   Takes over the role of the old ChromaDB `git_info` metadata blob. *)
+let migration_2 = [
+  {|CREATE TABLE IF NOT EXISTS edit_links (
+      edit_key     TEXT PRIMARY KEY,
+      session_id   TEXT,
+      turn_idx     INTEGER,
+      entry_idx    INTEGER,
+      file_base    TEXT,
+      commit_sha   TEXT,        -- NULL = dead/pending
+      diff_hash    TEXT,
+      origin       TEXT NOT NULL,  -- 'claude' | 'human'
+      branch       TEXT,
+      timestamp    REAL NOT NULL
+    )|};
+
+  {|CREATE INDEX IF NOT EXISTS edit_links_commit_idx
+      ON edit_links(commit_sha)|};
+  {|CREATE INDEX IF NOT EXISTS edit_links_file_idx
+      ON edit_links(file_base)|};
+  {|CREATE INDEX IF NOT EXISTS edit_links_session_turn_idx
+      ON edit_links(session_id, turn_idx)|};
+]
+
+(* Migration 3: enforce one row per (session_id, turn_index) so the
+   indexer can use ON CONFLICT ... DO UPDATE and preserve summaries on
+   re-run. Dedups any existing duplicates first. *)
+let migration_3 = [
+  (* Dedup: keep only the lowest id per (session_id, turn_index). *)
+  {|DELETE FROM steps WHERE id NOT IN (
+      SELECT MIN(id) FROM steps
+      GROUP BY session_id, turn_index
+    )|};
+  {|CREATE UNIQUE INDEX IF NOT EXISTS steps_session_turn_uq
+      ON steps(session_id, turn_index)|};
+]
+
 let migrations = [
   1, migration_1;
+  2, migration_2;
+  3, migration_3;
 ]
 
 (* --- meta helpers --- *)

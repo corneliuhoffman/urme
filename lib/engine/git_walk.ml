@@ -4,7 +4,8 @@
    branch, maintaining file states as patches on top of a base commit.
 
    Lwt-native: [walk] takes [materialise] and [save] as function
-   parameters so it can integrate cleanly with Irmin and ChromaDB. *)
+   parameters — V2 handlers in [Walk_handlers] bridge Irmin for reads
+   and SQLite [edit_links] for writes. *)
 
 open Lwt.Syntax
 open Git_link_types
@@ -66,7 +67,7 @@ type handlers = {
 let make_human_edit ~file ~old_string ~new_string ~timestamp ~branch =
   let edit_key = Printf.sprintf "human:%s:%s" file
       (Digest.string (old_string ^ "\x00" ^ new_string) |> Digest.to_hex) in
-  { edit_key; file_base = file;
+  { edit_key; file_base = Filename.basename file; file_path = file;
     old_string; new_string;
     replace_all = false; timestamp;
     session_id = "human"; interaction_index = 0;
@@ -92,7 +93,7 @@ let mark_dead ~h stack file ts =
   List.map (fun (e : stack_entry) ->
     if e.timestamp <= ts then
       { e with edits = List.map (fun (ed, s) ->
-          if ed.file_base = file && s <> Dead
+          if ed.file_path = file && s <> Dead
           then (ed, Dead) else (ed, s)) e.edits }
     else e) stack
   |> flush ~h
@@ -101,7 +102,7 @@ let assign ~h stack file sha ts =
   List.map (fun (e : stack_entry) ->
     if e.timestamp <= ts then
       { e with edits = List.map (fun (ed, s) ->
-          if ed.file_base = file && s = Pending
+          if ed.file_path = file && s = Pending
           then (ed, Committed sha) else (ed, s)) e.edits }
     else e) stack
   |> flush ~h
@@ -115,6 +116,18 @@ let get_state st file =
   match SMap.find_opt file st.file_states with
   | Some s -> s
   | None -> Absent
+
+(* Bootstrap file state from last_commit on first access.
+   Returns (state, updated st) with the file cached. *)
+let ensure_file ~h st file =
+  match SMap.find_opt file st.file_states with
+  | Some s -> Lwt.return (s, st)
+  | None ->
+    let* content = h.materialise ~commit:st.last_commit ~file ~patches:[] in
+    let s = match content with
+      | Some _ -> Patches []
+      | None -> Absent in
+    Lwt.return (s, set_file st file s)
 
 let materialise ~h st file =
   match get_state st file with
@@ -131,6 +144,7 @@ let current_patches st file =
 (* If expected != actual, push a human edit and append a delta patch
    so future materialisations produce [actual]. *)
 let reconcile ~h st file ~actual ts =
+  let* _, st = ensure_file ~h st file in
   let* expected = materialise ~h st file in
   let actual_s = Option.value actual ~default:"" in
   let expected_s = Option.value expected ~default:"" in
@@ -150,8 +164,8 @@ let reconcile ~h st file ~actual ts =
 (* ---------- Edit group event ---------- *)
 
 let apply_one ~h st (e : edit) =
-  let file = e.file_base in
-  let state = get_state st file in
+  let file = e.file_path in
+  let* state, st = ensure_file ~h st file in
 
   if e.old_string = "" then
     let* stack = mark_dead ~h st.stack file e.timestamp in

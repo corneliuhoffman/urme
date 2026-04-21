@@ -254,8 +254,6 @@ type state = {
   git : git_state;
   history : history_state;
   usage : Urme_core.Usage.usage_data option;
-  started_chroma : bool;
-  started_ollama : bool;
   tui_bridge : Tui_bridge.t option;
 }
 
@@ -271,7 +269,6 @@ let initial_state ~config ~project_dir = {
   palette_open = false; palette_selected = 0;
   git = empty_git_state; history = empty_history_state;
   usage = None;
-  started_chroma = false; started_ollama = false;
   tui_bridge = None;
 }
 
@@ -317,8 +314,8 @@ let sanitize_utf8 s =
     else
       let byte = Char.code s.[i] in
       if byte < 0x80 then begin
-        (* Replace control chars (below 0x20) with space, except allow nothing below *)
-        if byte >= 0x20 || byte = 0x09 then  (* allow tab *)
+        (* Replace control chars (including tabs) with space — Notty chokes *)
+        if byte >= 0x20 then
           Buffer.add_char buf s.[i]
         else
           Buffer.add_char buf ' ';
@@ -329,33 +326,53 @@ let sanitize_utf8 s =
           else if byte land 0xF0 = 0xE0 then 3
           else if byte land 0xF8 = 0xF0 then 4
           else 0 in
-        if expected = 0 || i + expected > len then begin
-          Buffer.add_char buf '?'; loop (i + 1)
-        end else
+        if expected = 0 || i + expected > len then
+          (* drop invalid lead byte *)
+          loop (i + 1)
+        else
           let rec valid j =
             j >= expected || (Char.code s.[i + j] land 0xC0 = 0x80 && valid (j + 1))
           in
           if valid 1 then begin
             Buffer.add_string buf (String.sub s i expected);
             loop (i + expected)
-          end else begin
-            Buffer.add_char buf '?'; loop (i + 1)
-          end
+          end else
+            (* drop invalid UTF-8 fragment *)
+            loop (i + 1)
   in
   loop 0
+
+(* Advance one UTF-8 code point from pos in s, return new pos *)
+let utf8_next s pos =
+  if pos >= String.length s then pos
+  else
+    let b = Char.code s.[pos] in
+    let step =
+      if b < 0x80 then 1
+      else if b land 0xE0 = 0xC0 then 2
+      else if b land 0xF0 = 0xE0 then 3
+      else if b land 0xF8 = 0xF0 then 4
+      else 1 in
+    min (pos + step) (String.length s)
 
 let wrap_text text width =
   if width <= 0 then [""]
   else
     String.split_on_char '\n' text
     |> List.concat_map (fun line ->
-      if String.length line <= width then [line]
+      let len = String.length line in
+      if len <= width then [line]
       else
+        (* Split into chunks of at most [width] code points each *)
         let rec split acc pos =
-          if pos >= String.length line then List.rev acc
+          if pos >= len then List.rev acc
           else
-            let len = min width (String.length line - pos) in
-            split (String.sub line pos len :: acc) (pos + len)
+            let rec advance p n =
+              if n <= 0 || p >= len then p
+              else advance (utf8_next line p) (n - 1) in
+            let end_pos = advance pos width in
+            let chunk = String.sub line pos (end_pos - pos) in
+            split (chunk :: acc) end_pos
         in
         split [] 0)
 
@@ -517,7 +534,46 @@ let split_into_interaction_turns ~filepath =
   close_in ic;
   List.rev !turns
 
+(* Strip control chars (except \t \n) and replace invalid UTF-8 *)
+let clean_output s =
+  let buf = Buffer.create (String.length s) in
+  let len = String.length s in
+  let i = ref 0 in
+  while !i < len do
+    let b = Char.code s.[!i] in
+    if b = 0x09 || b = 0x0a then begin
+      Buffer.add_char buf s.[!i]; incr i
+    end else if b < 0x20 || b = 0x7f then begin
+      (* Control char — skip *)
+      incr i
+    end else if b < 0x80 then begin
+      Buffer.add_char buf s.[!i]; incr i
+    end else begin
+      (* UTF-8 continuation expected *)
+      let expected =
+        if b land 0xE0 = 0xC0 then 2
+        else if b land 0xF0 = 0xE0 then 3
+        else if b land 0xF8 = 0xF0 then 4
+        else 0 in
+      if expected = 0 || !i + expected > len then begin
+        incr i  (* skip invalid lead byte *)
+      end else begin
+        let valid = ref true in
+        for j = 1 to expected - 1 do
+          if Char.code s.[!i + j] land 0xC0 <> 0x80 then valid := false
+        done;
+        if !valid then begin
+          Buffer.add_string buf (String.sub s !i expected);
+          i := !i + expected
+        end else
+          incr i
+      end
+    end
+  done;
+  Buffer.contents buf
+
 let truncate_result content =
+  let content = clean_output content in
   let lines = String.split_on_char '\n' content in
   let total = List.length lines in
   if total <= 20 && String.length content <= 1000 then content
@@ -554,54 +610,49 @@ let render_entry ~width ~verbose entry =
   | Thinking_block text ->
     if verbose then wrap_prefix "  [thinking] " c_thinking (wrap_text text (width - 14))
     else []
-  | Tool_use_block { tool_name; inline_diff; _ } ->
-    let header = Printf.sprintf "  [%s]" tool_name in
+  | Tool_use_block { tool_name; input; _ } ->
+    let open Yojson.Safe.Util in
+    let summary = match tool_name with
+      | "Bash" ->
+        let cmd = try input |> member "command" |> to_string with _ -> "" in
+        if String.length cmd > 80 then String.sub cmd 0 77 ^ "..." else cmd
+      | "Edit" | "Write" | "Read" ->
+        (try input |> member "file_path" |> to_string with _ -> "")
+      | "Grep" | "Glob" ->
+        (try input |> member "pattern" |> to_string with _ -> "")
+      | _ -> "" in
+    let header =
+      if summary = "" then Printf.sprintf "  [%s]" tool_name
+      else Printf.sprintf "  [%s] %s" tool_name summary in
     let hdr = List.map (mk c_tool_name) (wrap_text header width) in
-    let diff = match inline_diff with
-      | None -> []
-      | Some diff ->
-        let lines = String.split_on_char '\n' diff in
-        let lines = if List.length lines > 30 then
-          List.filteri (fun i _ -> i < 30) lines @
-          [Printf.sprintf "... (%d more lines)" (List.length lines - 30)]
-        else lines in
-        let parse_hunk line =
-          (* Parse @@ -old_start,old_len +new_start,new_len @@ *)
-          try Scanf.sscanf line "@@ -%d,%d +%d,%d @@%_s"
-                (fun o _ n _ -> Some (o, n))
-          with _ ->
-            try Scanf.sscanf line "@@ -%d +%d,%d @@%_s"
-                  (fun o n _ -> Some (o, n))
-            with _ ->
-              try Scanf.sscanf line "@@ -%d,%d +%d @@%_s"
-                    (fun o _ n -> Some (o, n))
-              with _ -> None
-        in
-        let old_ln = ref 0 in
-        let new_ln = ref 0 in
-        List.map (fun line ->
-          if String.length line > 0 then match line.[0] with
-            | '@' ->
-              (match parse_hunk line with
-               | Some (o, n) -> old_ln := o; new_ln := n
-               | None -> ());
-              mk c_tool_name ("    " ^ line)
-            | '+' ->
-              let prefix = Printf.sprintf "    %4d " !new_ln in
-              new_ln := !new_ln + 1;
-              mk ~bg:(Some c_diff_add_bg) c_diff_add_fg (prefix ^ line)
-            | '-' ->
-              let prefix = Printf.sprintf " %4d    " !old_ln in
-              old_ln := !old_ln + 1;
-              mk ~bg:(Some c_diff_del_bg) c_diff_del_fg (prefix ^ line)
-            | _ ->
-              let prefix = Printf.sprintf " %4d %4d " !old_ln !new_ln in
-              old_ln := !old_ln + 1; new_ln := !new_ln + 1;
-              mk c_fg (prefix ^ line)
-          else mk c_fg ""
-        ) lines
-    in
-    hdr @ diff
+    (* For Edit/Write, show inline old/new as colored lines *)
+    let body = match tool_name with
+      | "Edit" ->
+        let old_s = try input |> member "old_string" |> to_string with _ -> "" in
+        let new_s = try input |> member "new_string" |> to_string with _ -> "" in
+        let lines s prefix bg fg =
+          String.split_on_char '\n' s
+          |> List.filter_map (fun l ->
+            if l = "" then None
+            else Some (mk ~bg:(Some bg) fg ("    " ^ prefix ^ l))) in
+        let old_lines = lines old_s "- " c_diff_del_bg c_diff_del_fg in
+        let new_lines = lines new_s "+ " c_diff_add_bg c_diff_add_fg in
+        let truncate ls = if List.length ls > 15 then
+          List.filteri (fun i _ -> i < 15) ls @
+          [mk c_fg (Printf.sprintf "    ... (%d more)" (List.length ls - 15))]
+          else ls in
+        truncate old_lines @ truncate new_lines
+      | "Write" ->
+        let content = try input |> member "content" |> to_string with _ -> "" in
+        let lines = String.split_on_char '\n' content in
+        let n = List.length lines in
+        let shown = List.filteri (fun i _ -> i < 15) lines in
+        List.map (fun l ->
+          mk ~bg:(Some c_diff_add_bg) c_diff_add_fg ("    + " ^ l)) shown @
+        (if n > 15 then [mk c_fg (Printf.sprintf "    ... (%d more)" (n - 15))]
+         else [])
+      | _ -> [] in
+    hdr @ body
   | Tool_result_block { content; is_error; _ } ->
     let color = if is_error then c_error else c_tool_result in
     List.map (fun l -> mk color ("    " ^ l))
@@ -619,17 +670,34 @@ let ( <-> ) = Notty.I.( <-> )
 let ( </> ) = Notty.I.( </> )
 
 (* Build a single row image of exactly width w, with given attr *)
+(* Count UTF-8 code points in a string *)
+let utf8_count s =
+  let len = String.length s in
+  let rec loop i n =
+    if i >= len then n
+    else loop (utf8_next s i) (n + 1)
+  in loop 0 0
+
+(* Truncate to at most [n] UTF-8 code points *)
+let utf8_truncate s n =
+  let len = String.length s in
+  let rec advance p k =
+    if k <= 0 || p >= len then p
+    else advance (utf8_next s p) (k - 1) in
+  let end_pos = advance 0 n in
+  String.sub s 0 end_pos
+
 let mk_row ~attr w text =
   let text = sanitize_utf8 text in
-  let len = String.length text in
-  if len = 0 then
+  let cps = utf8_count text in
+  if cps = 0 then
     Notty.I.char attr ' ' w 1
   else
-    let display_len = min len w in
-    let text = if display_len < len then String.sub text 0 display_len else text in
-    let pad_n = max 0 (w - display_len) in
+    let display_cps = min cps w in
+    let text = if display_cps < cps then utf8_truncate text display_cps else text in
+    let pad_n = max 0 (w - display_cps) in
     let txt_img = (try Notty.I.string attr text
-      with _ -> Notty.I.string attr (String.make display_len '?')) in
+      with _ -> Notty.I.string attr (String.make display_cps '?')) in
     if pad_n > 0 then txt_img <|> Notty.I.char attr ' ' pad_n 1
     else txt_img
 
@@ -1193,36 +1261,40 @@ let load_git_data ~cwd =
                human_edits = Hashtbl.create 0; human_diffs = Hashtbl.create 0;
                link_candidates = [] }, debug)
 
-(* Rebuild in-memory git_links from ChromaDB's git_info metadata *)
-let load_git_links_from_chroma ~port ~project =
+(* Rebuild in-memory git_links from the [edit_links] table — which the
+   walker populates with real per-edit → commit provenance (not the
+   timestamp heuristic on [steps]). Includes both Claude-origin edits
+   (navigable to the authoring turn) and human-origin edits (surfaced
+   so the UI can colour the file blue and offer the diff). *)
+let load_git_links_from_db ~project_dir =
   Lwt.catch (fun () ->
-    let* collection_id =
-      Urme_search.Chromadb.ensure_interactions_collection ~port ~project in
-    let* existing_gis =
-      Urme_search.Chromadb.get_all_with_git_info ~port ~collection_id in
+    let db = Urme_store.Schema.open_or_create ~project_dir in
     let links : (string * string, git_conv_link list) Hashtbl.t =
       Hashtbl.create 256 in
-    List.iter (fun (_id, gi_str, session_id, _idx, _ts) ->
-      let tbl = parse_git_info gi_str in
-      Hashtbl.iter (fun ek value ->
-        match value with
-        | Some (gi : Urme_engine.Git_link_types.git_info) ->
-          let file_base = match String.split_on_char ':' ek with
-            | fb :: _ -> fb | [] -> "" in
-          if file_base <> "" then begin
-            let lk = (gi.commit_sha, file_base) in
-            let existing = match Hashtbl.find_opt links lk with
-              | Some l -> l | None -> [] in
-            if not (List.exists (fun (l : git_conv_link) -> l.edit_key = ek) existing) then begin
-              let link : git_conv_link = { commit_sha = gi.commit_sha; file = file_base;
-                           session_id; turn_idx = gi.turn_idx; entry_idx = gi.entry_idx;
-                           edit_key = ek } in
-              Hashtbl.replace links lk (existing @ [link])
-            end
-          end
-        | None -> ()
-      ) tbl
-    ) existing_gis;
+    List.iter (fun (row : Urme_store.Edit_links.row) ->
+      match row.commit_sha with
+      | None -> ()
+      | Some commit_sha ->
+        let session_id = match row.session_id with
+          | Some s -> s
+          | None -> "human"  (* walker convention for human rows *)
+        in
+        let lk = (commit_sha, row.file_base) in
+        let existing = match Hashtbl.find_opt links lk with
+          | Some l -> l | None -> [] in
+        if not (List.exists (fun (l : git_conv_link) ->
+                  l.edit_key = row.edit_key) existing) then begin
+          let link : git_conv_link = {
+            commit_sha;
+            file = row.file_base;
+            session_id;
+            turn_idx = row.turn_idx;
+            entry_idx = row.entry_idx;
+            edit_key = row.edit_key } in
+          Hashtbl.replace links lk (existing @ [link])
+        end
+    ) (Urme_store.Edit_links.all_with_commit db);
+    Urme_store.Schema.close db;
     Lwt.return links
   ) (fun _ -> Lwt.return (Hashtbl.create 0))
 
@@ -1232,43 +1304,10 @@ let switch_to_git mvar =
   redraw mvar;
   let* s = Lwt_mvar.take mvar in
   let* (git, debug) = load_git_data ~cwd:s.project_dir in
-  (* If in-memory git_links are empty, start ChromaDB if needed and load *)
   let* git_links =
-    if Hashtbl.length s.git.git_links > 0 then
-      Lwt.return s.git.git_links
-    else begin
-      let port = s.config.chromadb_port in
-      let* () = Lwt_mvar.put mvar { s with status_extra = "Starting ChromaDB..." } in
-      redraw mvar;
-      let start_chroma () =
-        let chroma_dir = Filename.concat s.project_dir "chroma" in
-        (try Unix.mkdir chroma_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
-        ignore (Sys.command (Printf.sprintf
-          "chroma run --port %d --path %s > /tmp/chromadb.log 2>&1 &" port chroma_dir));
-        let rec wait n =
-          if n <= 0 then Lwt.return_unit
-          else Lwt.catch (fun () ->
-            let uri = Uri.of_string (Printf.sprintf "http://[::1]:%d/api/v2/heartbeat" port) in
-            let* _resp, body = Cohttp_lwt_unix.Client.get uri in
-            let* _ = Cohttp_lwt.Body.to_string body in
-            Lwt.return_unit
-          ) (fun _ -> let* () = Lwt_unix.sleep 1.0 in wait (n - 1))
-        in wait 10
-      in
-      let* () = Lwt.catch (fun () ->
-        let uri = Uri.of_string (Printf.sprintf "http://[::1]:%d/api/v2/heartbeat" port) in
-        let* _resp, body = Cohttp_lwt_unix.Client.get uri in
-        let* _ = Cohttp_lwt.Body.to_string body in
-        Lwt.return_unit
-      ) (fun _ -> start_chroma ()) in
-      let* s = Lwt_mvar.take mvar in
-      let* () = Lwt_mvar.put mvar { s with status_extra = "Loading git links..." } in
-      redraw mvar;
-      let* links = load_git_links_from_chroma ~port
-          ~project:(Filename.basename s.project_dir) in
-      let* s = Lwt_mvar.take mvar in
-      ignore s; Lwt.return links
-    end in
+    if Hashtbl.length s.git.git_links > 0 then Lwt.return s.git.git_links
+    else load_git_links_from_db ~project_dir:s.project_dir
+  in
   let git = { git with git_links;
               human_edits = s.git.human_edits;
               human_diffs = s.git.human_diffs } in
@@ -1278,170 +1317,39 @@ let switch_to_git mvar =
   let* () = Lwt_mvar.put mvar { s with mode = Git; git; status_extra = status } in
   redraw mvar; Lwt.return_unit
 
-(* Check if a service is reachable *)
-let check_port port =
-  Lwt.catch (fun () ->
-    let uri = Uri.of_string (Printf.sprintf "http://[::1]:%d/api/v2/heartbeat" port) in
-    let* resp, body = Cohttp_lwt_unix.Client.get uri in
-    let* _ = Cohttp_lwt.Body.to_string body in
-    Lwt.return (Cohttp.Response.status resp |> Cohttp.Code.code_of_status = 200)
-  ) (fun _ -> Lwt.return false)
-
-let check_ollama url =
-  Lwt.catch (fun () ->
-    let uri = Uri.of_string (url ^ "/api/tags") in
-    let* resp, body = Cohttp_lwt_unix.Client.get uri in
-    let* _ = Cohttp_lwt.Body.to_string body in
-    Lwt.return (Cohttp.Response.status resp |> Cohttp.Code.code_of_status = 200)
-  ) (fun _ -> Lwt.return false)
-
-(* Start services if not running, wait for them to be ready.
-   Starts services if not already running. *)
-let ensure_services mvar ~chromadb_port ~ollama_url ~project_dir =
-  let* chroma_ok = check_port chromadb_port in
-  let* did_start_chroma = if not chroma_ok then begin
-    let* () = update mvar (fun s -> { s with status_extra = "Starting ChromaDB..." }) in
-    redraw mvar;
-    let chroma_dir = Filename.concat project_dir "chroma" in
-    (try Unix.mkdir chroma_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
-    let cmd = Printf.sprintf
-      "chroma run --port %d --path %s > /tmp/chromadb.log 2>&1 &"
-      chromadb_port chroma_dir in
-    ignore (Sys.command cmd);
-    let rec wait n =
-      if n <= 0 then Lwt.return false
-      else
-        let* ok = check_port chromadb_port in
-        if ok then Lwt.return true
-        else let* () = Lwt_unix.sleep 1.0 in wait (n - 1)
-    in
-    wait 10
-  end else Lwt.return false in
-  let* ollama_ok = check_ollama ollama_url in
-  let* did_start_ollama = if not ollama_ok then begin
-    let* () = update mvar (fun s -> { s with status_extra = "Starting Ollama..." }) in
-    redraw mvar;
-    ignore (Sys.command "ollama serve > /tmp/ollama.log 2>&1 &");
-    let rec wait n =
-      if n <= 0 then Lwt.return false
-      else
-        let* ok = check_ollama ollama_url in
-        if ok then Lwt.return true
-        else let* () = Lwt_unix.sleep 1.0 in wait (n - 1)
-    in
-    wait 10
-  end else Lwt.return false in
-  (* Track what we started *)
-  let* () = update mvar (fun s ->
-    { s with started_chroma = s.started_chroma || did_start_chroma;
-             started_ollama = s.started_ollama || did_start_ollama }) in
-  Lwt.return_unit
-
 (* Extract individual turns (user_text, assistant_text) from a session JSONL *)
-(* Index all session JSONL files into ChromaDB — incremental with git correlation *)
+(* Index all session JSONL files into the V2 SQLite store, then run the
+   per-edit git linker to populate edit_links. The Claude summarisation
+   pass is kicked off separately from the `urme init` subcommand. *)
 let index_sessions mvar =
   let* () = update mvar (fun s ->
-    { s with status_extra = "Starting services..." }) in
+    { s with status_extra = "Indexing into SQLite..." }) in
   redraw mvar;
   Lwt.async (fun () ->
     Lwt.catch (fun () ->
       let* s_val = Lwt_mvar.take mvar in
       let* () = Lwt_mvar.put mvar s_val in
-      let port = s_val.config.chromadb_port in
-      let ollama_url = s_val.config.ollama_url in
-      let project = Filename.basename s_val.project_dir in
       let cwd = s_val.project_dir in
-      let* () = ensure_services mvar ~chromadb_port:port ~ollama_url
-          ~project_dir:cwd in
-      let* () = update mvar (fun s -> { s with status_extra = "Updating index..." }) in
-      redraw mvar;
-      let* collection_id =
-        Urme_search.Chromadb.ensure_interactions_collection ~port ~project in
-      (* Batch-fetch all existing IDs in one call *)
-      let* existing_ids =
-        Urme_search.Chromadb.get_all_interaction_ids ~port ~collection_id in
-      let existing_set = Hashtbl.create (List.length existing_ids) in
-      List.iter (fun id -> Hashtbl.replace existing_set id ()) existing_ids;
-      let jsonl_dir = Urme_search.Jsonl_reader.find_jsonl_dir
-          ~project_dir:cwd in
-      let sessions = sort_by_size_desc
-        (Urme_search.Jsonl_reader.list_sessions ~jsonl_dir) in
-      let total = List.length sessions in
-      let n_new = ref 0 in
-      let n_skip = ref 0 in
-      let indexed_count = ref 0 in
-      (* Collect all new interactions, then batch-save *)
-      let pending = ref [] in
-      List.iter (fun filepath ->
-        let session_id = Filename.basename filepath |> Filename.chop_extension in
-        let interactions = Urme_search.Jsonl_reader.parse_interactions ~filepath in
-        if interactions <> [] then begin
-          incr indexed_count;
-          List.iteri (fun i (interaction : Urme_core.Types.interaction) ->
-            let id = Printf.sprintf "%s_%d" session_id i in
-            if Hashtbl.mem existing_set id then
-              incr n_skip
-            else begin
-              incr n_new;
-              pending := (id, session_id, i,
-                interaction.user_text, interaction.assistant_summary,
-                interaction.user_uuid, interaction.timestamp,
-                interaction.files_changed) :: !pending
-            end
-          ) interactions
-        end
-      ) sessions;
-      let all_pending = List.rev !pending in
-      let batch_size = 64 in
-      let batches = ref [] in
-      let cur = ref [] in
-      let cur_n = ref 0 in
-      List.iter (fun item ->
-        cur := item :: !cur;
-        incr cur_n;
-        if !cur_n >= batch_size then begin
-          batches := List.rev !cur :: !batches;
-          cur := []; cur_n := 0
-        end
-      ) all_pending;
-      if !cur <> [] then batches := List.rev !cur :: !batches;
-      let all_batches = List.rev !batches in
-      let n_batches = List.length all_batches in
-      let batch_i = ref 0 in
-      let* () = Lwt_list.iter_s (fun batch ->
-        incr batch_i;
-        let* () = update mvar (fun s ->
-          { s with status_extra =
-              Printf.sprintf "Indexing batch %d/%d (%d new, %d skip, %d sessions)"
-                !batch_i n_batches !n_new !n_skip total }) in
-        redraw mvar;
-        Lwt.catch (fun () ->
-          Urme_search.Chromadb.save_interactions_batch ~port ~collection_id batch
-        ) (fun exn ->
-          let oc = open_out_gen [Open_append; Open_creat] 0o644 "/tmp/urme_debug.log" in
-          Printf.fprintf oc "[%.2f] Batch %d FAILED: %s\n%!" (Unix.gettimeofday ()) !batch_i
-            (Printexc.to_string exn);
-          close_out oc;
-          Lwt.return_unit)
-      ) all_batches in
-      (* Branch-aware git linking via Git_index *)
+      let db = Urme_store.Schema.open_or_create ~project_dir:cwd in
+      let n = Urme_engine.Indexer.index_all_sessions ~db ~project_dir:cwd in
       let* () = update mvar (fun s ->
-        { s with status_extra = "Git links: diffing branches..." }) in
+        { s with status_extra =
+            Printf.sprintf "Indexed %d turns; building git links..." n }) in
       redraw mvar;
-      let pool = Domainslib.Task.setup_pool ~num_domains:4 () in
-      let edits = Urme_engine.Edit_extract.edits_of_sessions
-          ~pool ~project_dir:cwd in
-      Domainslib.Task.teardown_pool pool;
-      let* () = Urme_engine.Git_index.update
-          ~project_dir:cwd ~port ~collection_id ~edits in
-      (* Rebuild in-memory links for the TUI from ChromaDB *)
-      let* git_links = load_git_links_from_chroma ~port ~project in
+      let* () = Lwt.catch (fun () ->
+        let pool = Domainslib.Task.setup_pool ~num_domains:4 () in
+        let edits = Urme_engine.Edit_extract.edits_of_sessions
+            ~pool ~project_dir:cwd in
+        Domainslib.Task.teardown_pool pool;
+        Urme_engine.Git_index.update ~project_dir:cwd ~db ~edits
+      ) (fun _ -> Lwt.return_unit) in
+      Urme_store.Schema.close db;
+      let* git_links = load_git_links_from_db ~project_dir:cwd in
       let n_links = Hashtbl.length git_links in
       let* () = update mvar (fun s ->
         { s with git = { s.git with git_links };
                  status_extra =
-            Printf.sprintf "Done: %d new interactions | %d links (%d sessions)"
-              !n_new n_links total }) in
+            Printf.sprintf "Indexed %d turns | %d git links" n n_links }) in
       redraw mvar; Lwt.return_unit
     ) (fun exn ->
       let* () = update mvar (fun s ->
@@ -1452,24 +1360,33 @@ let index_sessions mvar =
 
 let execute_search mvar query =
   let* () = update mvar (fun s ->
-    { s with status_extra = "Starting services..." ;
+    { s with status_extra = "Searching..." ;
              history = { s.history with search_active = false } }) in
   redraw mvar;
   Lwt.async (fun () ->
     Lwt.catch (fun () ->
       let* s_val = Lwt_mvar.take mvar in
       let* () = Lwt_mvar.put mvar s_val in
-      let port = s_val.config.chromadb_port in
-      let ollama_url = s_val.config.ollama_url in
-      let project = Filename.basename s_val.project_dir in
-      let* () = ensure_services mvar ~chromadb_port:port ~ollama_url
-          ~project_dir:s_val.project_dir in
-      let* () = update mvar (fun s -> { s with status_extra = "Searching..." }) in
-      redraw mvar;
-      let* collection_id =
-        Urme_search.Chromadb.ensure_interactions_collection ~port ~project in
-      let* results = Urme_search.Chromadb.search_all_interactions ~port
-          ~collection_id ~query ~n:20 in
+      let db = Urme_store.Schema.open_or_create ~project_dir:s_val.project_dir in
+      let hits = Urme_search.Search.run_with_fallback ~db ~limit:20 query in
+      Urme_store.Schema.close db;
+      (* Adapt V2 hits to the TUI's existing tuple shape:
+         (session_id, user_text, document, turn_index, iso_ts, "distance").
+         Distance is BM25 flipped to non-negative so smaller-is-better
+         matches the display code written for L2. *)
+      let results = List.map (fun (h : Urme_search.Search.hit) ->
+        let tm = Unix.gmtime h.timestamp in
+        let ts_str = Printf.sprintf
+          "%04d-%02d-%02dT%02d:%02d:%02d.000Z"
+          (tm.tm_year + 1900) (tm.tm_mon + 1) tm.tm_mday
+          tm.tm_hour tm.tm_min tm.tm_sec in
+        let session_id = Option.value h.session_id ~default:"" in
+        let doc =
+          if h.summary <> "" then h.summary
+          else if h.prompt_text <> "" then h.prompt_text
+          else "" in
+        (session_id, h.prompt_text, doc, h.turn_index, ts_str, -. h.score)
+      ) hits in
       let* () = update mvar (fun s ->
         { s with history = { s.history with
             search_results = results;
@@ -1546,11 +1463,6 @@ let run ~config ~project_dir () =
        Lwt.catch (fun () -> Tui_bridge.stop tb) (fun _ -> Lwt.return_unit)
        |> Lwt.ignore_result
      | None -> ());
-    (* Gracefully stop services we started *)
-    if s.started_chroma then
-      ignore (Sys.command "pkill -TERM -f 'chroma run' 2>/dev/null");
-    if s.started_ollama then
-      ignore (Sys.command "pkill -TERM -x ollama 2>/dev/null");
     (* Quit terminal, then hard-exit to skip at_exit handlers that hit stale FDs *)
     (try Lwt.ignore_result (Notty_lwt.Term.release term) with _ -> ());
     Unix._exit 0
@@ -1812,8 +1724,8 @@ let run ~config ~project_dir () =
         let g = s.git in
         let git = match g.focus with
           | Branches -> { g with branch_idx = max 0 (g.branch_idx - 1) }
-          | Commits -> { g with commit_idx = prev_linked_commit g g.commit_idx }
-          | Files -> { g with file_idx = prev_linked_file g g.file_idx }
+          | Commits -> { g with commit_idx = max 0 (g.commit_idx - 1) }
+          | Files -> { g with file_idx = max 0 (g.file_idx - 1) }
           | Links -> { g with link_idx = max 0 (g.link_idx - 1) } in
         { s with git }) in
       redraw mvar; loop ()
@@ -1837,8 +1749,8 @@ let run ~config ~project_dir () =
         let g = s.git in
         let git = match g.focus with
           | Branches -> { g with branch_idx = min (List.length g.branches - 1) (g.branch_idx + 1) }
-          | Commits -> { g with commit_idx = next_linked_commit g g.commit_idx }
-          | Files -> { g with file_idx = next_linked_file g g.file_idx }
+          | Commits -> { g with commit_idx = min (List.length g.commits - 1) (g.commit_idx + 1) }
+          | Files -> { g with file_idx = min (List.length g.files - 1) (g.file_idx + 1) }
           | Links -> { g with link_idx = min (max 0 (List.length g.link_candidates - 1)) (g.link_idx + 1) } in
         { s with git }) in
       redraw mvar; loop ()
@@ -2158,7 +2070,7 @@ let run ~config ~project_dir () =
 
     | `Key (`ASCII 'i', [])
       when (match peek mvar with Some s -> s.mode = History | None -> false) ->
-      (* Wipe ChromaDB collections and re-index *)
+      (* Wipe the V2 SQLite store and re-index from JSONL. *)
       let* () = update mvar (fun s ->
         { s with status_extra = "Initialising (wiping DB)..." }) in
       redraw mvar;
@@ -2166,20 +2078,18 @@ let run ~config ~project_dir () =
         Lwt.catch (fun () ->
           let* s_val = Lwt_mvar.take mvar in
           let* () = Lwt_mvar.put mvar s_val in
-          let port = s_val.config.chromadb_port in
-          let project = Filename.basename s_val.project_dir in
-          let* () = ensure_services mvar ~chromadb_port:port
-              ~ollama_url:s_val.config.ollama_url ~project_dir:s_val.project_dir in
-          let* () = Lwt.catch (fun () ->
-            Urme_search.Chromadb.delete_collection ~port
-              ~name:(project ^ "_interactions")) (fun _ -> Lwt.return_unit) in
-          let* () = Lwt.catch (fun () ->
-            Urme_search.Chromadb.delete_collection ~port
-              ~name:(project ^ "_experiences")) (fun _ -> Lwt.return_unit) in
+          let db_path = Urme_store.Schema.default_path
+              ~project_dir:s_val.project_dir in
+          List.iter (fun suf ->
+            let p = db_path ^ suf in
+            if Sys.file_exists p then (try Sys.remove p with _ -> ())
+          ) ["-wal"; "-shm"; ""];
+          let state_path = Urme_engine.Git_state.state_path
+              ~project_dir:s_val.project_dir in
+          (try Sys.remove state_path with _ -> ());
           let* () = update mvar (fun s ->
             { s with status_extra = "Initialising: indexing..." }) in
           redraw mvar;
-          (* Now run index_sessions *)
           index_sessions mvar
         ) (fun exn ->
           let* () = update mvar (fun s ->

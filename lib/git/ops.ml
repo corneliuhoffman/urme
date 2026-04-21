@@ -1,5 +1,14 @@
 open Lwt.Syntax
 
+(* EINTR-safe waitpid. Inside the TUI, Notty's signal handlers (SIGWINCH
+   etc.) can interrupt waitpid; we just retry. *)
+let rec waitpid_noeintr pid =
+  Lwt.catch
+    (fun () -> Lwt_unix.waitpid [] pid)
+    (function
+      | Unix.Unix_error (Unix.EINTR, _, _) -> waitpid_noeintr pid
+      | e -> Lwt.fail e)
+
 (* Spawn a process, capture stdout, suppress stderr.
    Uses Unix.create_process (posix_spawn) — safe after Domain.spawn. *)
 let run_process prog argv =
@@ -22,7 +31,7 @@ let run_process prog argv =
   in
   let* () = read_all () in
   let* () = Lwt_io.close ic in
-  let* (_pid, status) = Lwt_unix.waitpid [] pid in
+  let* (_pid, status) = waitpid_noeintr pid in
   Lwt.return (Buffer.contents buf, status)
 
 (* Run a git command, return stdout (stderr suppressed) *)
