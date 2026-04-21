@@ -103,18 +103,33 @@ let expand_with_rewrite
 
 (* Bundle FTS5 expansion + Claude rerank + synthesis. Returns (ordered
    hits, synthesis). Ordering follows Claude's ranked step_ids; hits
-   Claude didn't rank get appended at the end by original BM25. *)
+   Claude didn't rank get appended at the end by original BM25.
+
+   Prefers summarised rows for the rerank shortlist — an unsummarised
+   row has no distilled content, so Claude can't judge it against
+   summarised ones. Only falls back to unsummarised rows when the
+   summarised set is too thin. *)
 let run_smart
     ~db ~binary
     ?(limit=default_limit)
-    ?(shortlist_size=12)
+    ?(shortlist_size=24)
     query =
   let open Lwt.Syntax in
   let* candidates = expand_with_rewrite ~db ~binary
-      ~limit:(max limit shortlist_size) query in
+      ~limit:(max limit shortlist_size * 2) query in
+  let with_summary, without_summary =
+    List.partition (fun (h : hit) -> h.summary <> "") candidates in
   let shortlist =
-    if List.length candidates <= shortlist_size then candidates
-    else List.filteri (fun i _ -> i < shortlist_size) candidates
+    let primary =
+      if List.length with_summary <= shortlist_size then with_summary
+      else List.filteri (fun i _ -> i < shortlist_size) with_summary
+    in
+    if List.length primary >= shortlist_size then primary
+    else
+      (* Pad with unsummarised rows to reach shortlist_size. *)
+      let need = shortlist_size - List.length primary in
+      let pad = List.filteri (fun i _ -> i < need) without_summary in
+      primary @ pad
   in
   let inputs = List.map (fun (h : hit) ->
     { Urme_claude.Prompts.step_id = h.step_id;
@@ -124,7 +139,8 @@ let run_smart
       prompt_excerpt =
         if String.length h.prompt_text > 160
         then String.sub h.prompt_text 0 160 ^ "..."
-        else h.prompt_text }
+        else h.prompt_text;
+      timestamp = h.timestamp }
   ) shortlist in
   let* { ranked_step_ids; synthesis } =
     Urme_claude.Prompts.rerank ~binary ~query ~candidates:inputs in

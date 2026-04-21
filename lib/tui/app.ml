@@ -658,7 +658,21 @@ let render_entry ~width ~verbose entry =
     List.map (fun l -> mk color ("    " ^ l))
       (wrap_text (truncate_result content) (width - 4)) @ [mk c_fg ""]
   | System_info text ->
-    wrap_prefix "  " c_error (wrap_text text (width - 2))
+    (* Unified-diff colouring: + green bg, - red bg, @@ hunk header,
+       +++/--- file header normal. Matches Edit/Write tool_use display. *)
+    let starts c s = String.length s > 0 && s.[0] = c in
+    let starts2 a b s = String.length s > 1 && s.[0] = a && s.[1] = b in
+    List.concat_map (fun line ->
+      let fg, bg =
+        if starts2 '+' '+' line || starts2 '-' '-' line then (c_fg, None)
+        else if starts '+' line then (c_diff_add_fg, Some c_diff_add_bg)
+        else if starts '-' line then (c_diff_del_fg, Some c_diff_del_bg)
+        else if starts '@' line then (c_highlight, None)
+        else (c_fg, None)
+      in
+      List.map (fun wrapped -> mk ~bg fg ("  " ^ wrapped))
+        (wrap_text line (width - 2))
+    ) (String.split_on_char '\n' text)
   | Turn_separator ->
     [mk c_separator ("  " ^ String.make (min 40 (width - 2)) '-'); mk c_fg ""]
 
@@ -992,17 +1006,24 @@ let render_history_results state w h =
     (title_row <-> empty_msg <-> fill)
   else begin
     let rows = ref [] in
-    List.iteri (fun i (session_id, user_text, _doc, _idx, _ts, distance) ->
+    List.iteri (fun i (session_id, user_text, doc, _idx, _ts, distance) ->
       if List.length !rows < content_h then begin
         let selected = i = hs.result_idx in
         let marker = if selected then ">" else " " in
         let fg_c = if selected then c_highlight else c_fg in
         let bg_c = if selected then c_selection_bg else c_bg in
-        let label = if user_text = "" then "(no text)" else
+        (* Prefer the summary (doc) as the primary label — it's the
+           distilled answer, not the raw prompt. Fall back to user_text
+           only when the row wasn't summarised. *)
+        let primary =
+          if doc <> "" then doc
+          else if user_text <> "" then user_text
+          else "(no text)" in
+        let label =
           let max_len = w - 14 in
-          if String.length user_text > max_len
-          then String.sub user_text 0 max_len ^ "..."
-          else user_text in
+          if String.length primary > max_len
+          then String.sub primary 0 max_len ^ "..."
+          else primary in
         let dist = Printf.sprintf "(%.2f)" distance in
         let line1 = Printf.sprintf " %s %s  %s" marker label dist in
         let line1 = if String.length line1 > w then String.sub line1 0 w else line1 in
@@ -1261,42 +1282,93 @@ let load_git_data ~cwd =
                human_edits = Hashtbl.create 0; human_diffs = Hashtbl.create 0;
                link_candidates = [] }, debug)
 
-(* Rebuild in-memory git_links from the [edit_links] table — which the
-   walker populates with real per-edit → commit provenance (not the
-   timestamp heuristic on [steps]). Includes both Claude-origin edits
-   (navigable to the authoring turn) and human-origin edits (surfaced
-   so the UI can colour the file blue and offer the diff). *)
+(* Rebuild in-memory git_links from the [edit_links] table.
+
+   Suppresses human-origin rows when a Claude row exists for the same
+   (commit_sha, file_base): the walker walks each branch independently,
+   and for commits shared across branches it can produce a spurious
+   "human" row on the branches where the Claude edits aren't tagged
+   (filtered out by the branch filter in walk_branch). Those are
+   artefacts of the branch-walk, not real human edits. *)
 let load_git_links_from_db ~project_dir =
   Lwt.catch (fun () ->
     let db = Urme_store.Schema.open_or_create ~project_dir in
+    let all = Urme_store.Edit_links.all_with_commit db in
+    (* First pass: collect (commit_sha, file_base) pairs that have at
+       least one claude-origin row. *)
+    let has_claude = Hashtbl.create 128 in
+    List.iter (fun (row : Urme_store.Edit_links.row) ->
+      if row.origin = "claude" then
+        match row.commit_sha with
+        | Some sha -> Hashtbl.replace has_claude (sha, row.file_base) ()
+        | None -> ()
+    ) all;
     let links : (string * string, git_conv_link list) Hashtbl.t =
       Hashtbl.create 256 in
     List.iter (fun (row : Urme_store.Edit_links.row) ->
       match row.commit_sha with
       | None -> ()
       | Some commit_sha ->
-        let session_id = match row.session_id with
-          | Some s -> s
-          | None -> "human"  (* walker convention for human rows *)
+        let is_shadowed_human =
+          row.origin = "human"
+          && Hashtbl.mem has_claude (commit_sha, row.file_base)
         in
-        let lk = (commit_sha, row.file_base) in
-        let existing = match Hashtbl.find_opt links lk with
-          | Some l -> l | None -> [] in
-        if not (List.exists (fun (l : git_conv_link) ->
-                  l.edit_key = row.edit_key) existing) then begin
-          let link : git_conv_link = {
-            commit_sha;
-            file = row.file_base;
-            session_id;
-            turn_idx = row.turn_idx;
-            entry_idx = row.entry_idx;
-            edit_key = row.edit_key } in
-          Hashtbl.replace links lk (existing @ [link])
+        if not is_shadowed_human then begin
+          let session_id = match row.session_id with
+            | Some s -> s
+            | None -> "human"
+          in
+          let lk = (commit_sha, row.file_base) in
+          let existing = match Hashtbl.find_opt links lk with
+            | Some l -> l | None -> [] in
+          if not (List.exists (fun (l : git_conv_link) ->
+                    l.edit_key = row.edit_key) existing) then begin
+            let link : git_conv_link = {
+              commit_sha;
+              file = row.file_base;
+              session_id;
+              turn_idx = row.turn_idx;
+              entry_idx = row.entry_idx;
+              edit_key = row.edit_key } in
+            Hashtbl.replace links lk (existing @ [link])
+          end
         end
-    ) (Urme_store.Edit_links.all_with_commit db);
+    ) all;
     Urme_store.Schema.close db;
     Lwt.return links
   ) (fun _ -> Lwt.return (Hashtbl.create 0))
+
+(* Pull (old, new) content for every human edit_link row, render a
+   unified diff, and populate [human_diffs]. Synchronous — runs off
+   the DB we already have open. *)
+let load_human_diffs_from_db ~project_dir ~git_links =
+  let diffs : (string * string, string) Hashtbl.t = Hashtbl.create 128 in
+  (try
+    let db = Urme_store.Schema.open_or_create ~project_dir in
+    List.iter (fun (row : Urme_store.Edit_links.row) ->
+      match row.commit_sha with
+      | None -> ()
+      | Some sha when row.origin = "human" ->
+        (* Render a simple unified diff from the persisted content pair. *)
+        let diff =
+          match Patch.diff
+                  (Some (row.file_base, row.old_content))
+                  (Some (row.file_base, row.new_content)) with
+          | Some p ->
+            let buf = Buffer.create 512 in
+            Patch.pp (Format.formatter_of_buffer buf) p;
+            Buffer.contents buf
+          | None ->
+            if row.new_content = "" then row.old_content
+            else row.new_content
+        in
+        Hashtbl.replace diffs (sha, row.file_base) diff
+      | _ -> ()
+    ) (Urme_store.Edit_links.all_with_commit db);
+    Urme_store.Schema.close db
+  with _ -> ());
+  ignore git_links;
+  diffs
 
 let switch_to_git mvar =
   let* s = Lwt_mvar.take mvar in
@@ -1308,9 +1380,13 @@ let switch_to_git mvar =
     if Hashtbl.length s.git.git_links > 0 then Lwt.return s.git.git_links
     else load_git_links_from_db ~project_dir:s.project_dir
   in
+  let human_diffs =
+    if Hashtbl.length s.git.human_diffs > 0 then s.git.human_diffs
+    else load_human_diffs_from_db ~project_dir:s.project_dir ~git_links
+  in
   let git = { git with git_links;
               human_edits = s.git.human_edits;
-              human_diffs = s.git.human_diffs } in
+              human_diffs } in
   let status = if git.branches = [] then
     Printf.sprintf "Git: no branches! %s" debug
   else Printf.sprintf "Git browser (%d link keys)" (Hashtbl.length git_links) in
@@ -1358,9 +1434,25 @@ let index_sessions mvar =
       redraw mvar; Lwt.return_unit));
   Lwt.return_unit
 
-let execute_search mvar query =
+let hit_to_tuple (h : Urme_search.Search.hit) =
+  let tm = Unix.gmtime h.timestamp in
+  let ts_str = Printf.sprintf
+    "%04d-%02d-%02dT%02d:%02d:%02d.000Z"
+    (tm.tm_year + 1900) (tm.tm_mon + 1) tm.tm_mday
+    tm.tm_hour tm.tm_min tm.tm_sec in
+  let session_id = Option.value h.session_id ~default:"" in
+  let doc =
+    if h.summary <> "" then h.summary
+    else if h.prompt_text <> "" then h.prompt_text
+    else "" in
+  (session_id, h.prompt_text, doc, h.turn_index, ts_str, -. h.score)
+
+(* [smart] = true runs Claude rewrite + rerank on top of FTS5.
+   Slower (a few seconds) but cleaner results on generic queries. *)
+let execute_search ?(smart=false) mvar query =
   let* () = update mvar (fun s ->
-    { s with status_extra = "Searching..." ;
+    { s with status_extra =
+               (if smart then "Searching (smart)..." else "Searching...");
              history = { s.history with search_active = false } }) in
   redraw mvar;
   Lwt.async (fun () ->
@@ -1368,32 +1460,28 @@ let execute_search mvar query =
       let* s_val = Lwt_mvar.take mvar in
       let* () = Lwt_mvar.put mvar s_val in
       let db = Urme_store.Schema.open_or_create ~project_dir:s_val.project_dir in
-      let hits = Urme_search.Search.run_with_fallback ~db ~limit:20 query in
+      let* hits, synthesis =
+        if smart then
+          let config = s_val.config in
+          Urme_search.Search.run_smart
+            ~db ~binary:config.claude_binary ~limit:20 query
+        else
+          Lwt.return
+            (Urme_search.Search.run_with_fallback ~db ~limit:20 query, "")
+      in
       Urme_store.Schema.close db;
-      (* Adapt V2 hits to the TUI's existing tuple shape:
-         (session_id, user_text, document, turn_index, iso_ts, "distance").
-         Distance is BM25 flipped to non-negative so smaller-is-better
-         matches the display code written for L2. *)
-      let results = List.map (fun (h : Urme_search.Search.hit) ->
-        let tm = Unix.gmtime h.timestamp in
-        let ts_str = Printf.sprintf
-          "%04d-%02d-%02dT%02d:%02d:%02d.000Z"
-          (tm.tm_year + 1900) (tm.tm_mon + 1) tm.tm_mday
-          tm.tm_hour tm.tm_min tm.tm_sec in
-        let session_id = Option.value h.session_id ~default:"" in
-        let doc =
-          if h.summary <> "" then h.summary
-          else if h.prompt_text <> "" then h.prompt_text
-          else "" in
-        (session_id, h.prompt_text, doc, h.turn_index, ts_str, -. h.score)
-      ) hits in
+      let results = List.map hit_to_tuple hits in
+      let status = match synthesis with
+        | "" -> Printf.sprintf "Found %d results" (List.length results)
+        | s -> Printf.sprintf "— %s" s
+      in
       let* () = update mvar (fun s ->
         { s with history = { s.history with
             search_results = results;
             showing_results = true;
             search_query = query;
             result_idx = 0 };
-          status_extra = Printf.sprintf "Found %d results" (List.length results) }) in
+          status_extra = status }) in
       redraw mvar; Lwt.return_unit
     ) (fun exn ->
       let* () = update mvar (fun s ->
@@ -1473,12 +1561,17 @@ let run ~config ~project_dir () =
     let h = s.history in
     match List.nth_opt h.search_results ri with
     | Some (session_id, user_text, _doc, _turn_idx, _ts, _dist) ->
-      (* Check if this is a human edit link *)
+      (* Check if this is a human edit link. The walker uses a `human:`
+         PREFIX on edit_keys (and session_id = "human"); V1 used a
+         suffix — accept either shape. *)
       let is_human_link = match List.nth_opt s.git.link_candidates ri with
         | Some link ->
           let ek = link.edit_key in
-          (String.length ek > 6 && String.sub ek (String.length ek - 6) 6 = ":human") ||
-          (String.length ek > 11 && String.sub ek (String.length ek - 11) 11 = ":human-only")
+          let n = String.length ek in
+          (n >= 6 && String.sub ek 0 6 = "human:") ||
+          (n > 6 && String.sub ek (n - 6) 6 = ":human") ||
+          (n > 11 && String.sub ek (n - 11) 11 = ":human-only") ||
+          link.session_id = "human"
         | None -> false in
       if is_human_link then
         let link_opt = List.nth_opt s.git.link_candidates ri in
@@ -1489,7 +1582,7 @@ let run ~config ~project_dir () =
           | None -> "No human-specific diff computed" in
         let short = if String.length commit_sha > 7
           then String.sub commit_sha 0 7 else commit_sha in
-        if session_id = "" then
+        if session_id = "" || session_id = "human" then
           (* Purely human — show diff only *)
           { s with history = { h with showing_results = false; result_idx = ri;
                                        turns = [[System_info (Printf.sprintf
@@ -1966,7 +2059,14 @@ let run ~config ~project_dir () =
       let query = (match peek mvar with
         | Some s -> s.history.search_query | None -> "") in
       if query <> "" then begin
-        let* () = execute_search mvar query in
+        (* Prefix '?' toggles smart mode (Claude rewrite + rerank). *)
+        let smart, q =
+          if String.length query > 0 && query.[0] = '?'
+          then true, String.sub query 1 (String.length query - 1) |> String.trim
+          else false, query in
+        let* () =
+          if q = "" then Lwt.return_unit
+          else execute_search ~smart mvar q in
         loop ()
       end else begin
         let* () = update mvar (fun s ->

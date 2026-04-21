@@ -1,11 +1,16 @@
 (* Branch-aware git↔edit walking algorithm.
 
    Folds over a time-sorted stream of EditGroup and Commit events per
-   branch, maintaining file states as patches on top of a base commit.
+   branch, maintaining each file's current content as a direct string
+   (no unified-diff round-trip). Writes go via handlers: Irmin for blob
+   reads, SQLite [edit_links] for saves.
 
-   Lwt-native: [walk] takes [materialise] and [save] as function
-   parameters — V2 handlers in [Walk_handlers] bridge Irmin for reads
-   and SQLite [edit_links] for writes. *)
+   Why no Patch library: we tried storing a chain of [Patch.t] and
+   materialising via [Patch.patch] on the commit-base blob. That lost
+   byte fidelity — Writes that produced byte-exact committed content
+   still looked like "human edits" at reconcile time because the
+   round-trip didn't preserve exact bytes. Tracking the resulting
+   string directly avoids the issue entirely. *)
 
 open Lwt.Syntax
 open Git_link_types
@@ -15,7 +20,7 @@ module SMap = Map.Make(String)
 (* ---------- Domain types ---------- *)
 
 type file_state =
-  | Patches of Patch.t list
+  | Content of string   (* walker's current belief about the file's bytes *)
   | Deleted
   | Absent
 
@@ -57,8 +62,9 @@ type event =
 (* ---------- Handler types ---------- *)
 
 type handlers = {
-  materialise : commit:string -> file:string -> patches:Patch.t list
-                -> string option Lwt.t;
+  (* Read the file's blob at [commit] from git (Irmin). Returns None
+     if the file didn't exist at that commit. *)
+  read_blob : commit:string -> file:string -> string option Lwt.t;
   save : stack_entry -> unit Lwt.t;
 }
 
@@ -73,11 +79,6 @@ let make_human_edit ~file ~old_string ~new_string ~timestamp ~branch =
     session_id = "human"; interaction_index = 0;
     turn_idx = 0; entry_idx = 0;
     git_branch = branch }
-
-let make_patch ~file ~old_content ~new_content =
-  Patch.diff
-    (Some (file, old_content))
-    (Some (file, new_content))
 
 let complete e =
   List.for_all (fun (_, s) -> s <> Pending) e.edits
@@ -117,49 +118,46 @@ let get_state st file =
   | Some s -> s
   | None -> Absent
 
-(* Bootstrap file state from last_commit on first access.
-   Returns (state, updated st) with the file cached. *)
+(* On first access, populate the cache from [last_commit]'s blob. *)
 let ensure_file ~h st file =
   match SMap.find_opt file st.file_states with
   | Some s -> Lwt.return (s, st)
   | None ->
-    let* content = h.materialise ~commit:st.last_commit ~file ~patches:[] in
+    let* content = h.read_blob ~commit:st.last_commit ~file in
     let s = match content with
-      | Some _ -> Patches []
+      | Some c -> Content c
       | None -> Absent in
     Lwt.return (s, set_file st file s)
 
+(* Walker's view of the file's bytes right now. *)
 let materialise ~h st file =
+  let* _, st = ensure_file ~h st file in
   match get_state st file with
-  | Absent | Deleted -> Lwt.return_none
-  | Patches ps -> h.materialise ~commit:st.last_commit ~file ~patches:ps
-
-let current_patches st file =
-  match get_state st file with
-  | Patches ps -> ps
-  | _ -> []
+  | Content s -> Lwt.return (Some s, st)
+  | Absent | Deleted -> Lwt.return (None, st)
 
 (* ---------- Reconcile ---------- *)
 
-(* If expected != actual, push a human edit and append a delta patch
-   so future materialisations produce [actual]. *)
-let reconcile ~h st file ~actual ts =
-  let* _, st = ensure_file ~h st file in
-  let* expected = materialise ~h st file in
+(* If walker-state != commit-actual, push a Human edit representing the
+   drift and snap state to [actual] so the next walk continues from
+   reality. [before] is the parent commit's content; preferred as the
+   human edit's old_string so the rendered diff matches git show. *)
+let reconcile ~h st file ~actual ?before ts =
+  let* expected, st = materialise ~h st file in
   let actual_s = Option.value actual ~default:"" in
   let expected_s = Option.value expected ~default:"" in
   if expected_s = actual_s then Lwt.return st
-  else
+  else begin
+    let diff_old = Option.value before ~default:expected_s in
     let hu = make_human_edit ~file
-        ~old_string:expected_s ~new_string:actual_s
+        ~old_string:diff_old ~new_string:actual_s
         ~timestamp:ts ~branch:st.branch in
     let entry = { origin = Human; edits = [hu, Pending]; timestamp = ts } in
-    let delta = make_patch ~file ~old_content:expected_s ~new_content:actual_s in
-    let new_patches = current_patches st file @ Option.to_list delta in
     let fs = match actual with
-      | Some _ -> Patches new_patches
+      | Some c -> Content c
       | None -> Deleted in
     Lwt.return { (set_file st file fs) with stack = st.stack @ [entry] }
+  end
 
 (* ---------- Edit group event ---------- *)
 
@@ -168,39 +166,32 @@ let apply_one ~h st (e : edit) =
   let* state, st = ensure_file ~h st file in
 
   if e.old_string = "" then
+    (* Write: overwrite content, mark prior edits dead. *)
     let* stack = mark_dead ~h st.stack file e.timestamp in
-    let* expected = materialise ~h st file in
-    let old_s = Option.value expected ~default:"" in
-    let p = make_patch ~file ~old_content:old_s ~new_content:e.new_string in
-    let new_patches = current_patches st file @ Option.to_list p in
-    let st = set_file { st with stack } file (Patches new_patches) in
+    let st = set_file { st with stack } file (Content e.new_string) in
     Lwt.return (st, Pending)
 
   else match state with
   | Absent | Deleted -> Lwt.return (st, Dead)
 
-  | Patches _ ->
-    let* content = materialise ~h st file in
-    match content with
-    | None -> Lwt.return (st, Dead)
-    | Some content ->
-      match find_substring e.old_string content with
-      | Some pos ->
-        let olen = String.length e.old_string in
-        let before = String.sub content 0 pos in
-        let after = String.sub content (pos + olen)
-            (String.length content - pos - olen) in
-        let new_content = before ^ e.new_string ^ after in
-        let p = make_patch ~file ~old_content:content ~new_content in
-        let new_patches = current_patches st file @ Option.to_list p in
-        Lwt.return (set_file st file (Patches new_patches), Pending)
+  | Content content ->
+    match find_substring e.old_string content with
+    | Some pos ->
+      let olen = String.length e.old_string in
+      let before = String.sub content 0 pos in
+      let after = String.sub content (pos + olen)
+          (String.length content - pos - olen) in
+      let new_content = before ^ e.new_string ^ after in
+      Lwt.return (set_file st file (Content new_content), Pending)
 
-      | None ->
-        let* st = reconcile ~h st file ~actual:(Some e.old_string) e.timestamp in
-        let p = make_patch ~file
-            ~old_content:e.old_string ~new_content:e.new_string in
-        let new_patches = current_patches st file @ Option.to_list p in
-        Lwt.return (set_file st file (Patches new_patches), Pending)
+    | None ->
+      (* Claude's Edit context doesn't match walker's state → someone
+         else modified the file between Claude edits. Reconcile to
+         bring walker in line, then record this edit as Dead (we can't
+         place it without its context). *)
+      let* st = reconcile ~h st file
+          ~actual:(Some e.old_string) e.timestamp in
+      Lwt.return (st, Dead)
 
 let process_edit_group ~h st (edits : edit list) =
   let ts = match edits with e :: _ -> e.timestamp | [] -> 0.0 in
@@ -219,14 +210,15 @@ let process_edit_group ~h st (edits : edit list) =
 
 let process_commit ~h st (ci : commit_info) =
   let* st = Lwt_list.fold_left_s (fun st (file, change) ->
-    let actual = match change with
-      | FileCreated c | FileEdited (_, c) -> Some c
-      | FileDeleted _ -> None in
-    let* st = reconcile ~h st file ~actual ci.timestamp in
+    let before, actual = match change with
+      | FileCreated c -> None, Some c
+      | FileEdited (b, c) -> Some b, Some c
+      | FileDeleted b -> Some b, None in
+    let* st = reconcile ~h st file ~actual ?before ci.timestamp in
     let* stack = assign ~h st.stack file ci.sha ci.timestamp in
     let st = { st with stack } in
     match actual with
-    | Some _ -> Lwt.return (set_file st file (Patches []))
+    | Some c -> Lwt.return (set_file st file (Content c))
     | None -> Lwt.return (set_file st file Deleted)
   ) st ci.changes in
   Lwt.return { st with last_commit = ci.sha }

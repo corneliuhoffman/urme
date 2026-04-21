@@ -279,6 +279,7 @@ type rerank_input = {
   summary : string;
   tags : string;
   prompt_excerpt : string;   (* first ~120 chars of prompt_text *)
+  timestamp : float;         (* unix epoch, for chronology queries *)
 }
 
 type rerank_output = {
@@ -288,9 +289,12 @@ type rerank_output = {
 
 let build_rerank_prompt ~query ~(candidates : rerank_input list) =
   let rows = List.map (fun c ->
+    let tm = Unix.gmtime c.timestamp in
+    let date = Printf.sprintf "%04d-%02d-%02d"
+      (tm.tm_year + 1900) (tm.tm_mon + 1) tm.tm_mday in
     Printf.sprintf
-      "- step_id=%d turn=%d\n  summary: %s\n  tags: %s\n  prompt: %s"
-      c.step_id c.turn_index
+      "- step_id=%d turn=%d date=%s\n  summary: %s\n  tags: %s\n  prompt: %s"
+      c.step_id c.turn_index date
       (clamp 200 c.summary)
       (clamp 120 c.tags)
       (clamp 120 c.prompt_excerpt)
@@ -303,9 +307,24 @@ let build_rerank_prompt ~query ~(candidates : rerank_input list) =
     "Candidate rows (unsorted):";
     String.concat "\n" rows;
     "";
+    "Ranking rules:";
+    "- PREFER rows whose SUMMARY describes a concrete action, decision, \
+     or outcome that answers the query. The summary is the distilled \
+     answer; the prompt is just what the user asked.";
+    "- DEPRIORITISE rows that are just the user ASKING a similar \
+     question (prompt repeats or paraphrases the query; summary is \
+     empty or meta). These are meta-matches, not answers.";
+    "- DEPRIORITISE rows with empty summary unless the prompt itself \
+     uniquely answers the query.";
+    "- CHRONOLOGY: if the query asks \"when did we first X\", \"when \
+     did X start\", \"first time we discussed X\" etc., PREFER the \
+     EARLIEST date among rows that genuinely touch X. Later \
+     diagnoses/meta-discussions of X are not the origin.";
+    "- DROP rows that clearly don't match.";
+    "";
     "Return a JSON object with two keys:";
-    "- `ranked`: array of step_id integers, best first, only from the \
-     candidates above. Drop ones that clearly don't match.";
+    "- `ranked`: array of step_id integers, best first, from the \
+     candidates above.";
     "- `synthesis`: ONE short sentence answering the user's question, \
      grounded in the kept rows. Empty string if the candidates don't \
      answer it.";

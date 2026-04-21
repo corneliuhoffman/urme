@@ -14,7 +14,7 @@
 module D = Db
 module S = Sqlite3
 
-let schema_version = 3
+let schema_version = 4
 
 (* Migration 1: initial schema. *)
 let migration_1 = [
@@ -146,10 +146,23 @@ let migration_3 = [
       ON steps(session_id, turn_index)|};
 ]
 
+(* Migration 4: store the edit's [old_content] and [new_content] so the
+   TUI can render a diff for human-origin rows without re-running
+   `git diff` on the fly. For Claude rows these are the Edit's
+   old_string/new_string (or "" + Write content). For Human rows they
+   are the walker's expected_s (what it thinks the file should be) and
+   actual_s (what git actually has) at reconcile time — i.e. the
+   "fixing diff" the user asked about. *)
+let migration_4 = [
+  {|ALTER TABLE edit_links ADD COLUMN old_content TEXT|};
+  {|ALTER TABLE edit_links ADD COLUMN new_content TEXT|};
+]
+
 let migrations = [
   1, migration_1;
   2, migration_2;
   3, migration_3;
+  4, migration_4;
 ]
 
 (* --- meta helpers --- *)

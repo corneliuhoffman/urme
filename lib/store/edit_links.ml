@@ -12,33 +12,38 @@ module S = Sqlite3
 module D = Db
 
 type row = {
-  edit_key   : string;
-  session_id : string option;
-  turn_idx   : int;
-  entry_idx  : int;
-  file_base  : string;
-  commit_sha : string option;
-  diff_hash  : string;
-  origin     : string;    (* "claude" | "human" *)
-  branch     : string;
-  timestamp  : float;
+  edit_key    : string;
+  session_id  : string option;
+  turn_idx    : int;
+  entry_idx   : int;
+  file_base   : string;
+  commit_sha  : string option;
+  diff_hash   : string;
+  origin      : string;    (* "claude" | "human" *)
+  branch      : string;
+  timestamp   : float;
+  old_content : string;    (* "" for Write/human-reconcile-on-absent *)
+  new_content : string;    (* content the edit wrote *)
 }
 
 let row_of_cols cols =
-  { edit_key   = D.data_to_string cols.(0);
-    session_id = D.data_to_string_opt cols.(1);
-    turn_idx   = D.data_to_int cols.(2);
-    entry_idx  = D.data_to_int cols.(3);
-    file_base  = D.data_to_string cols.(4);
-    commit_sha = D.data_to_string_opt cols.(5);
-    diff_hash  = D.data_to_string cols.(6);
-    origin     = D.data_to_string cols.(7);
-    branch     = D.data_to_string cols.(8);
-    timestamp  = D.data_to_float cols.(9) }
+  { edit_key    = D.data_to_string cols.(0);
+    session_id  = D.data_to_string_opt cols.(1);
+    turn_idx    = D.data_to_int cols.(2);
+    entry_idx   = D.data_to_int cols.(3);
+    file_base   = D.data_to_string cols.(4);
+    commit_sha  = D.data_to_string_opt cols.(5);
+    diff_hash   = D.data_to_string cols.(6);
+    origin      = D.data_to_string cols.(7);
+    branch      = D.data_to_string cols.(8);
+    timestamp   = D.data_to_float cols.(9);
+    old_content = D.data_to_string cols.(10);
+    new_content = D.data_to_string cols.(11) }
 
 let select_cols =
   "edit_key, session_id, turn_idx, entry_idx, file_base, \
-   commit_sha, diff_hash, origin, branch, timestamp"
+   commit_sha, diff_hash, origin, branch, timestamp, \
+   COALESCE(old_content,''), COALESCE(new_content,'')"
 
 (* Upsert a row. commit_sha = None means clear the link back to pending. *)
 let upsert db row =
@@ -47,19 +52,23 @@ let upsert db row =
   let csha =
     match row.commit_sha with Some s -> S.Data.TEXT s | None -> S.Data.NULL in
   D.exec_params db
-    (Printf.sprintf
-       "INSERT INTO edit_links(%s) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-        ON CONFLICT(edit_key) DO UPDATE SET \
-          session_id = excluded.session_id, \
-          turn_idx   = excluded.turn_idx, \
-          entry_idx  = excluded.entry_idx, \
-          file_base  = excluded.file_base, \
-          commit_sha = excluded.commit_sha, \
-          diff_hash  = excluded.diff_hash, \
-          origin     = excluded.origin, \
-          branch     = excluded.branch, \
-          timestamp  = excluded.timestamp"
-       select_cols)
+    "INSERT INTO edit_links(\
+       edit_key, session_id, turn_idx, entry_idx, file_base, \
+       commit_sha, diff_hash, origin, branch, timestamp, \
+       old_content, new_content) \
+     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+     ON CONFLICT(edit_key) DO UPDATE SET \
+       session_id  = excluded.session_id, \
+       turn_idx    = excluded.turn_idx, \
+       entry_idx   = excluded.entry_idx, \
+       file_base   = excluded.file_base, \
+       commit_sha  = excluded.commit_sha, \
+       diff_hash   = excluded.diff_hash, \
+       origin      = excluded.origin, \
+       branch      = excluded.branch, \
+       timestamp   = excluded.timestamp, \
+       old_content = excluded.old_content, \
+       new_content = excluded.new_content"
     [ S.Data.TEXT row.edit_key;
       sid;
       S.Data.INT (Int64.of_int row.turn_idx);
@@ -69,7 +78,9 @@ let upsert db row =
       S.Data.TEXT row.diff_hash;
       S.Data.TEXT row.origin;
       S.Data.TEXT row.branch;
-      S.Data.FLOAT row.timestamp ]
+      S.Data.FLOAT row.timestamp;
+      S.Data.TEXT row.old_content;
+      S.Data.TEXT row.new_content ]
 
 (* Mark an edit pending/dead by clearing commit_sha. Keeps the rest of the
    row intact so the walker can revisit it later. *)

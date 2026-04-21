@@ -1,18 +1,14 @@
 (* Handlers for Git_walk: bridge the pure walking algorithm to
    real IO — Irmin for file reads, SQLite [edit_links] for writes. *)
 
-open Lwt.Syntax
 open Git_link_types
 
-(* ---------- Materialise: read from Irmin + apply patches ---------- *)
+(* ---------- Read blob from Irmin ---------- *)
 
-let materialise ~repo ~commit ~file ~patches =
-  let* base = Lwt.catch (fun () ->
+let read_blob ~repo ~commit ~file =
+  Lwt.catch (fun () ->
     Urme_store.Project_store.read_blob ~repo ~sha:commit ~path:file
-  ) (fun _ -> Lwt.return_none) in
-  Lwt.return (List.fold_left (fun acc p ->
-    Patch.patch ~cleanly:false acc p
-  ) base patches)
+  ) (fun _ -> Lwt.return_none)
 
 (* ---------- Save: write edit linkage to SQLite ---------- *)
 
@@ -39,7 +35,13 @@ let row_of_edit ~origin ~branch (edit : edit) ~status =
     diff_hash;
     origin = (match origin with Git_walk.Claude -> "claude" | Git_walk.Human -> "human");
     branch;
-    timestamp = edit.timestamp; }
+    timestamp = edit.timestamp;
+    (* For a Claude Edit: before/after strings of the edit.
+       For a Claude Write: old_string is "", new_string is the whole file.
+       For a Human (reconcile): expected_s (walker thought was there)
+       and actual_s (git actually has). *)
+    old_content = edit.old_string;
+    new_content = edit.new_string; }
 
 (* Save a completed stack_entry: upsert one row per edit.
    Pending edits (still unmatched after the walk) are skipped — the
@@ -59,6 +61,5 @@ let save ~db (entry : Git_walk.stack_entry) =
 (* ---------- Build handlers record ---------- *)
 
 let make ~repo ~db : Git_walk.handlers =
-  { materialise = (fun ~commit ~file ~patches ->
-      materialise ~repo ~commit ~file ~patches);
+  { read_blob = (fun ~commit ~file -> read_blob ~repo ~commit ~file);
     save = (fun entry -> save ~db entry); }
