@@ -1,3 +1,3 @@
 (library
  (name urme_tui)
- (libraries urme_core urme_engine urme_git urme_search urme_store cohttp-lwt-unix notty notty.lwt lwt lwt.unix patch))
+ (libraries urme_core urme_engine urme_git urme_search urme_store cohttp-lwt-unix notty notty.lwt nottui nottui-lwt lwd lwt lwt.unix patch))

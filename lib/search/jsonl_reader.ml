@@ -56,7 +56,12 @@ let current_session ~jsonl_dir =
 let session_id_of_path path =
   Filename.basename path |> Filename.chop_extension
 
-(* Check if a user message is a real user text (not a tool_result) *)
+(* A "real" user message is a user-type entry with a plain string
+   content that isn't a tool_result *and* isn't synthetic CLI-noise
+   like <local-command-stdout>…</…> or <command-name>…. Edit_extract
+   uses the same filter, so the indexer's turn numbering now agrees
+   with edit_links.turn_idx — otherwise turn_idx=33 in [steps] and
+   turn_idx=33 in [edit_links] refer to different turns. *)
 let is_real_user_message (json : Yojson.Safe.t) =
   let open Yojson.Safe.Util in
   let typ = json |> member "type" |> to_string_option in
@@ -64,7 +69,9 @@ let is_real_user_message (json : Yojson.Safe.t) =
   | Some "user" ->
     let content = json |> member "message" |> member "content" in
     (match content with
-     | `String _ -> true
+     | `String s ->
+       let s = String.trim s in
+       s <> "" && not (String.length s > 0 && s.[0] = '<')
      | _ -> false)
   | _ -> false
 
@@ -90,6 +97,10 @@ let extract_uuid (json : Yojson.Safe.t) =
   json |> member "uuid" |> to_string_option |> Option.value ~default:""
 
 (* Extract text blocks from assistant messages *)
+(* Concatenate assistant output in block order. Thinking blocks are
+   labelled `[thinking]` so the summariser can tell reasoning from
+   spoken output; it's still the same "assistant produced this"
+   stream, just with the hidden layer included. *)
 let extract_assistant_text (json : Yojson.Safe.t) =
   let open Yojson.Safe.Util in
   let typ = json |> member "type" |> to_string_option in
@@ -100,6 +111,10 @@ let extract_assistant_text (json : Yojson.Safe.t) =
     List.filter_map (fun block ->
       match block |> member "type" |> to_string_option with
       | Some "text" -> block |> member "text" |> to_string_option
+      | Some "thinking" ->
+        (match block |> member "thinking" |> to_string_option with
+         | Some t when t <> "" -> Some ("[thinking]\n" ^ t)
+         | _ -> None)
       | _ -> None
     ) blocks
   | _ -> []

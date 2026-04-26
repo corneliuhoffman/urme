@@ -1,29 +1,88 @@
 open Lwt.Syntax
 
+(* EINTR-safe waitpid. Inside the TUI, Notty's signal handlers (SIGWINCH
+   etc.) can interrupt waitpid; we just retry. *)
+let rec waitpid_noeintr pid =
+  Lwt.catch
+    (fun () -> Lwt_unix.waitpid [] pid)
+    (function
+      | Unix.Unix_error (Unix.EINTR, _, _) -> waitpid_noeintr pid
+      | e -> Lwt.fail e)
+
 (* Spawn a process, capture stdout, suppress stderr.
-   Uses Unix.create_process (posix_spawn) — safe after Domain.spawn. *)
+   Uses Unix.create_process (posix_spawn) — safe after Domain.spawn.
+
+   Two separate leak classes this guards against:
+   - FD leak on exceptions: if read_all raised, close_ic was skipped and
+     the pipe read-end stayed open. Under heavy load (thousands of git
+     subprocesses) this quickly exhausted the per-process FD limit.
+   - Zombie leak on exceptions: if close_ic raised, waitpid_noeintr was
+     never called and the child became a zombie — visible as hundreds
+     of <defunct> entries under [urme init] in ps.
+
+   Fix: run both cleanups in finalize. The exit-status reporting path
+   shares the same waitpid so we only wait once. *)
 let run_process prog argv =
+  (* Allocate all FDs first, then spawn inside a try. If create_process
+     raises (EMFILE under load, ENOMEM, etc.) we must close every FD we
+     already allocated — otherwise they leak for good and snowball into
+     more EMFILEs. *)
   let rd, wr = Unix.pipe ~cloexec:true () in
-  let devnull = Unix.openfile "/dev/null" [Unix.O_WRONLY] 0 in
-  let pid = Unix.create_process prog argv Unix.stdin wr devnull in
-  Unix.close wr;
-  Unix.close devnull;
+  let devnull_out = Unix.openfile "/dev/null" [Unix.O_WRONLY; Unix.O_CLOEXEC] 0 in
+  let devnull_in  = Unix.openfile "/dev/null" [Unix.O_RDONLY; Unix.O_CLOEXEC] 0 in
+  let safe_close fd = try Unix.close fd with _ -> () in
+  let pid =
+    try Unix.create_process prog argv devnull_in wr devnull_out
+    with e ->
+      safe_close rd; safe_close wr;
+      safe_close devnull_in; safe_close devnull_out;
+      raise e
+  in
+  safe_close wr;
+  safe_close devnull_in;
+  safe_close devnull_out;
   let fd = Lwt_unix.of_unix_file_descr rd in
   let ic = Lwt_io.of_fd ~mode:Lwt_io.input fd in
-  let buf = Buffer.create 256 in
-  let rec read_all () =
-    let* line = Lwt_io.read_line_opt ic in
-    match line with
-    | Some l ->
-      if Buffer.length buf > 0 then Buffer.add_char buf '\n';
-      Buffer.add_string buf l;
-      read_all ()
-    | None -> Lwt.return_unit
+  let ic_closed = ref false in
+  let reaped_status = ref None in
+  let close_ic () =
+    if !ic_closed then Lwt.return_unit
+    else begin ic_closed := true;
+      Lwt.catch (fun () -> Lwt_io.close ic) (fun _ -> Lwt.return_unit)
+    end
   in
-  let* () = read_all () in
-  let* () = Lwt_io.close ic in
-  let* (_pid, status) = Lwt_unix.waitpid [] pid in
-  Lwt.return (Buffer.contents buf, status)
+  let reap () =
+    match !reaped_status with
+    | Some _ -> Lwt.return_unit
+    | None ->
+      Lwt.catch
+        (fun () ->
+          let* _pid, status = waitpid_noeintr pid in
+          reaped_status := Some status; Lwt.return_unit)
+        (fun _ ->
+          reaped_status := Some (Unix.WEXITED 255); Lwt.return_unit)
+  in
+  Lwt.finalize
+    (fun () ->
+      let buf = Buffer.create 256 in
+      let rec read_all () =
+        let* line = Lwt_io.read_line_opt ic in
+        match line with
+        | Some l ->
+          if Buffer.length buf > 0 then Buffer.add_char buf '\n';
+          Buffer.add_string buf l;
+          read_all ()
+        | None -> Lwt.return_unit
+      in
+      let* () = read_all () in
+      let* () = close_ic () in
+      let* () = reap () in
+      let status = match !reaped_status with
+        | Some s -> s | None -> Unix.WEXITED 255 in
+      Lwt.return (Buffer.contents buf, status))
+    (fun () ->
+      let* () = close_ic () in
+      reap ())
 
 (* Run a git command, return stdout (stderr suppressed) *)
 let run_git ~cwd args =
@@ -172,11 +231,12 @@ let commit_changed_files ~cwd ~sha =
         (fun _exn -> Lwt.return []))
 
 (* Walk git log — returns list of (sha, timestamp, message) *)
-let walk_log ~cwd ?(since="") ?(max_count=1000) ?(all=false) () =
+let walk_log ~cwd ?(since="") ?(max_count=1000) ?(all=false) ?(branch="") () =
   let args = ["log"; "--format=%H%n%at%n%s%n---"] @
     (if all then ["--all"] else []) @
     (if since <> "" then ["--since=" ^ since] else []) @
-    ["--max-count=" ^ string_of_int max_count] in
+    ["--max-count=" ^ string_of_int max_count] @
+    (if branch <> "" then [branch] else []) in
   let* output = Lwt.catch
     (fun () -> run_git ~cwd args)
     (fun _exn -> Lwt.return "") in

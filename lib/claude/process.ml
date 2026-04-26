@@ -1,25 +1,30 @@
+(* Claude CLI subprocess — oneshot + persistent daemon modes.
+
+   Both are spawned via [Unix.create_process_env] (posix_spawn on
+   supported platforms) so they remain safe after [Domain.spawn].
+
+   - [spawn_oneshot] : one prompt, fresh process, closes on completion.
+     Good for ad-hoc calls where the ~10s claude startup tax is fine.
+   - [spawn_daemon]  : long-lived process, accepts N prompts over stdin
+     as NDJSON, emits NDJSON events on stdout. Good for high-volume
+     batched work (e.g. summarising hundreds of turns) — the startup
+     tax is paid once. *)
+
 open Lwt.Syntax
 
-(* Claude CLI as a persistent JSON daemon.
-
-   Spawns:  claude --print --input-format stream-json --output-format stream-json --verbose
-   The process stays alive with stdin open. We send user messages as NDJSON on
-   stdin and read events from stdout. Claude holds full conversation context
-   in memory — no need to re-spawn per message.
-
-   Permission prompts are routed through an MCP tool (permission bridge) that
-   communicates with the TUI via Unix domain socket. *)
-
 type claude_opts = {
-  model : string option;
-  system_prompt : string option;
-  allowed_tools : string list;
-  max_turns : int option;
-  extra_args : string list;
-  (* Permission bridge: when set, generates MCP config and passes
-     --mcp-config + --permission-prompt-tool to Claude CLI *)
-  permission_bridge_binary : string option;
-  permission_socket_path : string option;
+  model          : string option;
+  system_prompt  : string option;
+  allowed_tools  : string list;
+  max_turns      : int option;
+  extra_args     : string list;
+  bare           : bool;
+    (* --bare skips hooks, LSP, plugins, attribution, auto-memory, keychain
+       reads and CLAUDE.md discovery. Cuts the default system prompt from
+       ~32K tokens to ~1K. Essential for throughput on summarise-style
+       calls where we don't need any of that context. *)
+  no_tools       : bool;
+    (* --tools "" — disable all tool access. Trims cache further. *)
 }
 
 let default_opts = {
@@ -28,57 +33,11 @@ let default_opts = {
   allowed_tools = [];
   max_turns = None;
   extra_args = [];
-  permission_bridge_binary = None;
-  permission_socket_path = None;
+  bare = false;
+  no_tools = false;
 }
 
-(* A persistent Claude daemon handle *)
-type t = {
-  proc : Lwt_process.process_full;
-  events : Stream.stream_event Lwt_stream.t;
-  push : Stream.stream_event option -> unit;
-  mutable session_id : string option;
-  mcp_config_path : string option;
-}
-
-(* Write MCP config to a temp file, return path *)
-let write_mcp_config ~bridge_binary ~socket_path =
-  let config = Yojson.Safe.to_string (`Assoc [
-    "mcpServers", `Assoc [
-      "urme_perms", `Assoc [
-        "type", `String "stdio";
-        "command", `String bridge_binary;
-        "args", `List [`String socket_path];
-      ]
-    ]
-  ]) in
-  let path = Filename.temp_file "urme-mcp-" ".json" in
-  let oc = open_out path in
-  output_string oc config;
-  close_out oc;
-  path
-
-(* Build flags for persistent daemon mode *)
-let daemon_flags ~opts =
-  let args = ["--print";
-              "--input-format"; "stream-json";
-              "--output-format"; "stream-json";
-              "--verbose"] in
-  let args = match opts.model with
-    | Some m -> args @ ["--model"; m]
-    | None -> args in
-  let args = match opts.system_prompt with
-    | Some s -> args @ ["--system-prompt"; s]
-    | None -> args in
-  let args = match opts.max_turns with
-    | Some n -> args @ ["--max-turns"; string_of_int n]
-    | None -> args in
-  let args = List.fold_left (fun acc tool ->
-    acc @ ["--allowedTools"; tool]
-  ) args opts.allowed_tools in
-  args @ opts.extra_args
-
-(* Strip ANTHROPIC_API_KEY (use Max subscription) and CLAUDECODE (no nesting) *)
+(* Strip ANTHROPIC_API_KEY (force Max subscription) and CLAUDECODE. *)
 let clean_env () =
   Unix.environment ()
   |> Array.to_list
@@ -91,135 +50,209 @@ let clean_env () =
     not (starts_with "CLAUDE_CODE_ENTRYPOINT="))
   |> Array.of_list
 
-(* Write a JSON line to stdin *)
-let write_json t json =
-  let line = Yojson.Safe.to_string json ^ "\n" in
-  let* () = Lwt_io.write t.proc#stdin line in
-  Lwt_io.flush t.proc#stdin
+(* Shared: consume stderr so the child doesn't block on a full pipe.
+   Assumes [err_rd] has already been put into non-blocking mode. *)
+let drain_stderr err_rd =
+  let ic =
+    Lwt_io.of_fd ~mode:Lwt_io.input
+      (Lwt_unix.of_unix_file_descr ~blocking:false err_rd) in
+  Lwt.async (fun () ->
+    Lwt.catch (fun () ->
+      Lwt_stream.iter (fun _ -> ()) (Lwt_io.read_lines ic)
+    ) (fun _ -> Lwt.return_unit))
 
-(* Read lines from stdout, parse events *)
-let reader_loop t =
-  let rec loop () =
-    let* line = Lwt.catch
-      (fun () -> Lwt_io.read_line_opt t.proc#stdout)
-      (fun _exn -> Lwt.return_none) in
-    match line with
+(* ---------- Oneshot ---------- *)
+
+type oneshot = {
+  oneshot_events : Stream.stream_event Lwt_stream.t;
+  oneshot_pid    : int;
+}
+
+let common_flags ~opts =
+  (* --no-session-persistence: don't write session JSONL to
+     ~/.claude/projects/…  Critical for our summariser — otherwise
+     every `urme init` re-indexes its own prior summarise prompts, and
+     each summariser pass recursively summarises summaries. *)
+  let args = ["--no-session-persistence"] in
+  let args = if opts.bare then args @ ["--bare"] else args in
+  let args = if opts.no_tools then args @ ["--tools"; ""] else args in
+  let args = match opts.model with
+    | Some m -> args @ ["--model"; m] | None -> args in
+  let args = match opts.system_prompt with
+    | Some s -> args @ ["--system-prompt"; s] | None -> args in
+  let args = match opts.max_turns with
+    | Some n -> args @ ["--max-turns"; string_of_int n] | None -> args in
+  let args = List.fold_left (fun acc tool ->
+    acc @ ["--allowedTools"; tool]) args opts.allowed_tools in
+  args @ opts.extra_args
+
+let oneshot_args ~opts ~prompt =
+  ["--print"; "--output-format"; "stream-json"; "--verbose";
+   "-p"; prompt] @ common_flags ~opts
+
+let spawn_oneshot ?(cwd=".") ?(opts=default_opts) ~binary ~prompt () =
+  let flags = oneshot_args ~opts ~prompt in
+  let argv = Array.of_list (binary :: flags) in
+  let env = clean_env () in
+
+  let devnull_in = Unix.openfile "/dev/null" [Unix.O_RDONLY] 0 in
+  let out_rd, out_wr = Unix.pipe ~cloexec:true () in
+  let err_rd, err_wr = Unix.pipe ~cloexec:true () in
+
+  let pid =
+    if cwd = "." || cwd = "" then
+      Unix.create_process_env binary argv env devnull_in out_wr err_wr
+    else
+      let quoted = Array.to_list argv
+        |> List.map Filename.quote |> String.concat " " in
+      let shell_cmd = Printf.sprintf "cd %s && exec %s"
+        (Filename.quote cwd) quoted in
+      Unix.create_process_env "/bin/sh"
+        [| "/bin/sh"; "-c"; shell_cmd |] env
+        devnull_in out_wr err_wr
+  in
+  Unix.close out_wr; Unix.close err_wr; Unix.close devnull_in;
+
+  Unix.set_nonblock out_rd;
+  Unix.set_nonblock err_rd;
+
+  let out_ic =
+    Lwt_io.of_fd ~mode:Lwt_io.input
+      (Lwt_unix.of_unix_file_descr ~blocking:false out_rd) in
+  drain_stderr err_rd;
+
+  let events, push = Lwt_stream.create () in
+  let rec reader () =
+    let* line_opt = Lwt.catch
+      (fun () -> Lwt_io.read_line_opt out_ic)
+      (fun _ -> Lwt.return_none) in
+    match line_opt with
     | Some line ->
       (match Stream.parse_line line with
-       | Some (Stream.System_init { session_id; _ } as event) ->
-         t.session_id <- Some session_id;
-         t.push (Some event)
-       | Some event ->
-         t.push (Some event)
+       | Some event -> push (Some event)
        | None -> ());
+      reader ()
+    | None -> push None; Lwt.return_unit
+  in
+  Lwt.async reader;
+  Lwt.return { oneshot_events = events; oneshot_pid = pid }
+
+let iter_events o ~f = Lwt_stream.iter_s f o.oneshot_events
+
+(* EINTR-safe waitpid: signal-driven TUIs (notty, etc.) can interrupt. *)
+let rec waitpid_noeintr pid =
+  Lwt.catch
+    (fun () -> Lwt_unix.waitpid [] pid)
+    (function
+      | Unix.Unix_error (Unix.EINTR, _, _) -> waitpid_noeintr pid
+      | e -> Lwt.fail e)
+
+let wait o =
+  let* _pid, status = waitpid_noeintr o.oneshot_pid in
+  Lwt.return status
+
+(* ---------- Persistent daemon ---------- *)
+
+type daemon = {
+  daemon_pid     : int;
+  daemon_stdin   : Lwt_io.output_channel;
+  daemon_events  : Stream.stream_event Lwt_stream.t;
+}
+
+let daemon_args ~opts =
+  ["--print"; "--input-format"; "stream-json";
+   "--output-format"; "stream-json"; "--verbose"]
+  @ common_flags ~opts
+
+let spawn_daemon ?(cwd=".") ?(opts=default_opts) ~binary () =
+  let flags = daemon_args ~opts in
+  let argv = Array.of_list (binary :: flags) in
+  let env = clean_env () in
+
+  let in_rd, in_wr = Unix.pipe ~cloexec:true () in
+  let out_rd, out_wr = Unix.pipe ~cloexec:true () in
+  let err_rd, err_wr = Unix.pipe ~cloexec:true () in
+
+  let pid =
+    if cwd = "." || cwd = "" then
+      Unix.create_process_env binary argv env in_rd out_wr err_wr
+    else
+      let quoted = Array.to_list argv
+        |> List.map Filename.quote |> String.concat " " in
+      let shell_cmd = Printf.sprintf "cd %s && exec %s"
+        (Filename.quote cwd) quoted in
+      Unix.create_process_env "/bin/sh"
+        [| "/bin/sh"; "-c"; shell_cmd |] env
+        in_rd out_wr err_wr
+  in
+  Unix.close in_rd; Unix.close out_wr; Unix.close err_wr;
+
+  (* Force non-blocking on the parent's ends so Lwt's scheduler drives
+     them via kqueue/epoll instead of dispatching to a background thread
+     pool that can starve. *)
+  Unix.set_nonblock in_wr;
+  Unix.set_nonblock out_rd;
+  Unix.set_nonblock err_rd;
+
+  let stdin_chan =
+    Lwt_io.of_fd ~mode:Lwt_io.output
+      (Lwt_unix.of_unix_file_descr ~blocking:false in_wr) in
+  let out_ic =
+    Lwt_io.of_fd ~mode:Lwt_io.input
+      (Lwt_unix.of_unix_file_descr ~blocking:false out_rd) in
+  drain_stderr err_rd;
+
+  let events, push = Lwt_stream.create () in
+  let rec reader () =
+    let* line_opt = Lwt.catch
+      (fun () -> Lwt_io.read_line_opt out_ic)
+      (fun _ -> Lwt.return_none) in
+    match line_opt with
+    | Some line ->
+      (match Stream.parse_line line with
+       | Some event -> push (Some event)
+       | None -> ());
+      reader ()
+    | None -> push None; Lwt.return_unit
+  in
+  Lwt.async reader;
+  Lwt.return { daemon_pid = pid; daemon_stdin = stdin_chan;
+               daemon_events = events }
+
+(* Send one prompt down the daemon's stdin, read events until the next
+   [Result] marker, return the accumulated assistant text.
+
+   Assumes the caller serialises ask calls on a single daemon — two
+   concurrent asks would interleave event streams and garbage the
+   output boundary. The pool in [prompts.ml] enforces this. *)
+let ask_daemon d ~prompt =
+  let line =
+    let json = `Assoc [
+      "type", `String "user";
+      "message", `Assoc [
+        "role", `String "user";
+        "content", `String prompt;
+      ];
+    ] in
+    Yojson.Safe.to_string json ^ "\n"
+  in
+  let* () = Lwt_io.write d.daemon_stdin line in
+  let* () = Lwt_io.flush d.daemon_stdin in
+  let buf = Buffer.create 1024 in
+  let rec loop () =
+    let* ev = Lwt_stream.get d.daemon_events in
+    match ev with
+    | Some (Stream.Assistant_message { content; _ }) ->
+      Buffer.add_string buf (Stream.text_of_content content);
       loop ()
-    | None ->
-      t.push None;
-      Lwt.return_unit
+    | Some (Stream.Result _) -> Lwt.return (Buffer.contents buf)
+    | Some _ -> loop ()
+    | None -> Lwt.return (Buffer.contents buf)
   in
   loop ()
 
-(* Clean up temp MCP config file *)
-let cleanup_mcp_config t =
-  match t.mcp_config_path with
-  | Some path -> (try Unix.unlink path with Unix.Unix_error _ -> ())
-  | None -> ()
-
-(* Spawn the persistent Claude daemon.
-   When permission_bridge_binary and permission_socket_path are set,
-   generates MCP config and passes --permission-prompt-tool. *)
-let spawn ?(cwd=".") ?(opts=default_opts) ~binary () =
-  let flags = daemon_flags ~opts in
-  let mcp_config_path, flags =
-    match opts.permission_bridge_binary, opts.permission_socket_path with
-    | Some bridge_bin, Some sock_path ->
-      let cfg_path = write_mcp_config ~bridge_binary:bridge_bin
-          ~socket_path:sock_path in
-      let extra = ["--mcp-config"; cfg_path;
-                   "--permission-prompt-tool";
-                   "mcp__urme_perms__prompt_permission"] in
-      (Some cfg_path, flags @ extra)
-    | _ ->
-      (None, flags)
-  in
-  let args = [binary] @ flags in
-  let cmd = (binary, Array.of_list args) in
-  let env = clean_env () in
-  let proc = Lwt_process.open_process_full ~cwd ~env cmd in
-  let events, push = Lwt_stream.create () in
-  let t = { proc; events; push; session_id = None; mcp_config_path } in
-  Lwt.async (fun () -> reader_loop t);
-  Lwt.return t
-
-(* Send a user message to the daemon *)
-let send t ~text =
-  let json = `Assoc [
-    "type", `String "user";
-    "message", `Assoc [
-      "role", `String "user";
-      "content", `String text;
-    ];
-  ] in
-  write_json t json
-
-(* Read the next event from the stream *)
-let next_event t =
-  Lwt_stream.get t.events
-
-(* Iterate over all events *)
-let iter_events t ~f =
-  Lwt_stream.iter_s f t.events
-
-(* Collect all text until the stream ends *)
-let collect_text t =
-  let buf = Buffer.create 256 in
-  let* () = Lwt_stream.iter (function
-    | Stream.Assistant_message { content; _ } ->
-      Buffer.add_string buf (Stream.text_of_content content)
-    | _ -> ()
-  ) t.events in
-  Lwt.return (Buffer.contents buf)
-
-(* Wait for the process to finish *)
-let wait t =
-  cleanup_mcp_config t;
-  t.proc#close
-
-(* Kill the daemon *)
-let kill t =
-  cleanup_mcp_config t;
-  t.proc#kill Sys.sigterm
-
-(* One-shot spawn for `urme ask` — runs with -p, no daemon stdin loop *)
-let spawn_oneshot ?(cwd=".") ?(opts=default_opts) ~binary ~prompt () =
-  let args = ["--print";
-              "--output-format"; "stream-json";
-              "--verbose";
-              "-p"; prompt] in
-  let args = match opts.model with
-    | Some m -> args @ ["--model"; m]
-    | None -> args in
-  let args = match opts.system_prompt with
-    | Some s -> args @ ["--system-prompt"; s]
-    | None -> args in
-  let args = match opts.max_turns with
-    | Some n -> args @ ["--max-turns"; string_of_int n]
-    | None -> args in
-  let args = List.fold_left (fun acc tool ->
-    acc @ ["--allowedTools"; tool]
-  ) args opts.allowed_tools in
-  let args = args @ opts.extra_args in
-  let cmd_args = [binary] @ args in
-  let cmd = (binary, Array.of_list cmd_args) in
-  let env = clean_env () in
-  let proc = Lwt_process.open_process_full ~cwd ~env cmd in
-  let events, push = Lwt_stream.create () in
-  let t = { proc; events; push; session_id = None; mcp_config_path = None } in
-  Lwt.async (fun () -> reader_loop t);
-  Lwt.return t
-
-(* Check if still running *)
-let is_running t =
-  match Lwt.state (t.proc#status) with
-  | Lwt.Sleep -> true
-  | _ -> false
+let close_daemon d =
+  let* () = Lwt.catch (fun () -> Lwt_io.close d.daemon_stdin)
+    (fun _ -> Lwt.return_unit) in
+  let* _pid, status = waitpid_noeintr d.daemon_pid in
+  Lwt.return status

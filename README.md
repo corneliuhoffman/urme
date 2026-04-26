@@ -1,191 +1,123 @@
-# Experience Agents (urme)
+# urme
 
-OCaml TUI + MCP server for linking git history to Claude Code conversations. Browse commits, see which Claude edits explain each diff, detect human edit modifications, and search past interactions.
+OCaml TUI + MCP server for linking git history to Claude Code conversations.
+Browse commits, see which Claude edits explain each diff, detect human
+modifications, and search past interactions.
 
 ## How It Works
 
-Every time you save a step, the agent:
-1. Creates a **git micro-commit** capturing the current file state
-2. Computes the **diff** and list of changed files
-3. Stores the full **conversation transcript**, intent, and metadata in ChromaDB (vector DB)
-4. Indexes by both intent and conversation for **three-stage semantic search**
+urme V2 is a single-binary tool backed by a local SQLite store
+(`.urme/db.sqlite` at the project root). There are no external services —
+no ChromaDB, no Ollama, no vector embeddings.
 
-This means Claude can later search for similar past work, replay step-by-step solutions, or semantically undo to a previous state.
+1. **Indexing**: reads the Claude Code session logs under
+   `~/.claude/projects/<encoded-project-path>/*.jsonl` and writes one
+   `steps` row per turn, with deterministic metadata (files touched,
+   commands run, tokens, git commit_before/after).
+2. **Summarisation**: runs the `claude` CLI (Haiku 4.5, one spawn per
+   batch of 8 turns) to produce a one-sentence summary + 3–8 tags for
+   each step. Written back into the step row; FTS5 indexes them
+   automatically.
+3. **Git linkage**: runs the branch-aware `Git_walk` algorithm against
+   the Edit/Write tool_use history and populates the `edit_links` table
+   with per-edit → commit linkage. Human edits (content in a commit
+   that no Claude edit explains) are detected by reconciliation.
+4. **Search**: FTS5 + BM25 over `summary`, `tags`, `prompt_text`.
+   Optional `--smart` mode has Claude rewrite sparse queries and
+   rerank the shortlist with a one-sentence synthesis answer.
+
+Claude access goes exclusively through the `claude` CLI subprocess — no
+`ANTHROPIC_API_KEY`, no direct API calls. Uses your Max subscription.
 
 ## Build
 
 ```
 make setup   # install OCaml dependencies
-make build   # build and copy binary to bin/experience-agent
+make build   # build + copy binary to bin/experience-agent
 make clean   # remove build artifacts
 ```
 
+Dependencies: `ocaml >= 4.14`, `opam`. See `scripts/setup.sh` for the
+full package list.
 
+## First run
 
-## Manual Setup
-
-### 1. Start Ollama and ChromaDB
-
-Both must be running before using the experience agent:
-
-```
-ollama serve &
-chroma run --port 8000 &
-```
-
-On macOS with Apple Silicon, prefix Ollama with:
-```
-GGML_METAL_TENSOR_DISABLE=1 ollama serve &
-```
-
-### 2. Add MCP Server to Claude Code
-
-The binary is at `bin/experience-agent` after building.
-
-**Option A: Global via CLI (recommended)**
+In any project directory:
 
 ```
-claude mcp add -s user experience /path/to/experience-agent/bin/experience-agent -- --chromadb-port 8000 --project-dir .
+bin/experience-agent --project-dir . init
 ```
 
-This writes to `~/.claude.json` and works in all projects.
+This:
+1. Creates `.urme/db.sqlite`.
+2. Indexes every Claude Code session JSONL under the project's
+   `~/.claude/projects/` path.
+3. Builds per-edit git linkage (runs the walker).
+4. Runs the Haiku summarisation pass on every turn (~seconds per batch
+   of 8 turns; costs against your Max subscription, not tokens billed
+   to a key).
 
-**Option B: Per-project via `.mcp.json`**
+Add `--skip-summaries` to defer the LLM pass.
 
-Create a `.mcp.json` file in the root of a specific project:
+## TUI
+
+```
+bin/experience-agent --project-dir .
+```
+
+Modes:
+- **History** — list sessions, browse turns, search (FTS5 BM25).
+- **Git** — browse branches/commits/files with per-file Claude-edit
+  attribution and human-edit highlighting.
+
+## CLI search
+
+```
+bin/experience-agent search "why did tests fail on new files"
+bin/experience-agent search "how did we detect human edits" --smart
+```
+
+`--smart` adds Claude query rewrite (on sparse hits) and rerank.
+Adds latency; useful when lexical search returns nothing relevant.
+
+## Export / import
+
+```
+bin/experience-agent export /tmp/backup.sqlite
+bin/experience-agent import /tmp/backup.sqlite --project-dir /other/repo --force
+```
+
+Uses SQLite's `VACUUM INTO` under the hood — produces a standard
+`.sqlite` file anyone can open. WAL-state-safe; can run alongside the
+summariser.
+
+## MCP server
+
+```
+bin/experience-agent serve --project-dir .
+```
+
+Speaks JSON-RPC 2.0 over stdio. Six tools:
+`search_history`, `file_history`, `region_blame`, `explain_change`,
+`commit_links`, `search_by_file`.
+
+Register with Claude Code:
+
+```
+claude mcp add -s user experience /path/to/bin/experience-agent -- --project-dir .
+```
+
+Or per-project `.mcp.json`:
 ```json
 {
   "mcpServers": {
     "experience": {
       "type": "stdio",
-      "command": "/path/to/experience-agent/bin/experience-agent",
-      "args": ["--chromadb-port", "8000", "--project-dir", "."]
+      "command": "/path/to/bin/experience-agent",
+      "args": ["--project-dir", ".", "serve"]
     }
   }
 }
-```
-
-**Option C: Project-scoped via CLI**
-
-```
-claude mcp add -s project experience /path/to/experience-agent/bin/experience-agent -- --chromadb-port 8000 --project-dir .
-```
-
-This writes to the project's `.mcp.json`.
-
-After adding, restart Claude Code (or start a new session). Verify with `/mcp` to see the server status — all 11 tools should appear.
-
-## Usage
-
-Once running, Claude Code gains experience memory — it can save, search, and replay past work across sessions.
-
-### Manual Mode
-
-Save individual steps on demand:
-
-| Command | What it does |
-|---|---|
-| `save experience` | Save current work as a checkpoint (git micro-commit + vector DB) |
-| `search experience` | Find relevant past experiences to inform the current task |
-| `go back to ...` | Semantic undo — revert to a previous state by description |
-| `show experience steps` | List all steps in the current session |
-| `commit experience` | Squash all micro-commits into one clean commit |
-| `list experiences` | Show all saved experiences for the project |
-| `delete experience <id>` | Remove a saved experience by ID |
-| `replay experience ...` | Replay a past experience step-by-step with full conversation data |
-
-### Auto-Recording Mode
-
-Auto-recording tracks every conversation turn as a step automatically. This is useful for capturing a full workflow end-to-end.
-
-| Command | What it does |
-|---|---|
-| `start experience` | Enter auto-recording mode |
-| *(work normally)* | Each turn is saved as a step automatically |
-| `no` / reject | Roll back the last step if it wasn't useful |
-| `save experience` | Finalize the group — squashes micro-commits, saves as a searchable experience group |
-
-In auto-recording mode:
-- After each conversation turn, Claude calls `save_step` with the full transcript
-- If you say **yes** or continue working, the step is kept
-- If you say **no** or express disapproval, Claude calls `reject_step` to undo the last step (rolls back git + removes from vector DB)
-- When you're done, say `save experience` to finalize — this squashes all micro-commits into one clean commit and saves the group as a single searchable entity
-- Auto-recording stays on after saving, so you can start another group immediately
-
-### Replay
-
-Search for a past experience and get back the full step-by-step conversation data:
-
-```
-replay experience "adding authentication to the API"
-```
-
-This returns either:
-- An **experience group** (from auto-recording) with all individual steps and their conversations in order
-- A **single experience** with its full conversation transcript
-
-Use this to re-follow a previous solution or adapt it to a new context.
-
-### Semantic Undo
-
-`go back` uses semantic search to find the state you want to revert to:
-
-```
-go back to before the auth changes
-go back to when the tests were passing
-go back to step 3
-```
-
-It searches both the current session's steps and past saved experiences. You'll see the match and confirm before it applies the rollback.
-
-## CLAUDE.md Setup
-
-Add this to the `CLAUDE.md` of any project where you want experience memory:
-
-```
-You have access to an experience memory system via MCP tools (experience server).
-
-When working on tasks, search for relevant past experiences using
-mcp__experience__search_experience to draw on previous solutions and patterns.
-
-When the user says "save experience":
-- Call mcp__experience__save_step with:
-  - label: short description of what was accomplished
-  - intent: the original user request
-  - conversation: the FULL conversation transcript since the last save point (or session start).
-    Include all user messages, your reasoning, tool calls with inputs/outputs, and the outcome.
-
-When the user says "search experience":
-- Call mcp__experience__search_experience with the user's query to find relevant past experiences
-- Use the results to inform your approach
-
-When the user says "go back to ..." / "undo to ..." / "revert to ...":
-- Call mcp__experience__go_back with the user's description as the query
-- Show the matched experience and ask for confirmation
-- Call go_back again with confirm=true to apply
-
-When the user says "show experience steps":
-- Call mcp__experience__show_steps
-
-When the user says "commit experience":
-- Call mcp__experience__commit with a commit message
-
-When the user says "list experiences":
-- Call mcp__experience__list_experiences
-
-When the user says "delete experience <id>":
-- Call mcp__experience__delete_experience with the given ID
-
-When the user says "start experience":
-- Call mcp__experience__start_experiences to enter auto-recording mode
-- After each conversation turn, call mcp__experience__save_step with the full transcript
-- If the user rejects (says "no", expresses disapproval), call mcp__experience__reject_step
-- When the user says "save experience" during auto-recording, call mcp__experience__save_experience
-  with a label and intent to finalize the group
-
-When the user says "replay experience ...":
-- Call mcp__experience__replay_experience with the user's description
-- Present the returned steps and conversations for reference
 ```
 
 ## Author

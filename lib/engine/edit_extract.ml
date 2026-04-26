@@ -13,7 +13,52 @@ let read_lines filepath =
 let parse_json_safe line =
   try Some (Yojson.Safe.from_string line) with _ -> None
 
-let edits_of_session ~filepath =
+(* Last-occurrence substring search. Returns the index of the start of
+   the last match, or None. *)
+let find_last_substring s needle =
+  let nlen = String.length needle in
+  let slen = String.length s in
+  if nlen = 0 || nlen > slen then None
+  else
+    let rec scan i acc =
+      if i > slen - nlen then acc
+      else if String.sub s i nlen = needle
+      then scan (i + 1) (Some i)
+      else scan (i + 1) acc
+    in scan 0 None
+
+(* Map an absolute Edit/Write [file_path] to a repo-relative path. The
+   walker compares this against [git diff --name-only] output (which is
+   repo-relative), so leaving a foreign absolute prefix in place breaks
+   commit attribution.
+
+   Two sources of absolute paths to handle:
+   1. JSONL recorded on this machine: starts with [project_dir/].
+      Strip the prefix.
+   2. JSONL imported from another machine: starts with a foreign
+      absolute prefix (e.g. /Users/dimitris/projects/opengrep/opengrep/...).
+      Find the last "/<basename>/" segment and take the suffix — the
+      repo basename is usually distinctive enough to disambiguate.
+   Paths matching neither (e.g. /tmp/x.ml or another user's
+   ~/.claude/...) are returned unchanged; the linker will skip them. *)
+let normalize_file_path ~project_dir fp =
+  let pd = project_dir ^ "/" in
+  let pdlen = String.length pd in
+  if String.length fp >= pdlen
+     && String.sub fp 0 pdlen = pd
+  then String.sub fp pdlen (String.length fp - pdlen)
+  else
+    let basename = Filename.basename project_dir in
+    if basename = "" then fp
+    else
+      let needle = "/" ^ basename ^ "/" in
+      match find_last_substring fp needle with
+      | Some pos ->
+        let start = pos + String.length needle in
+        String.sub fp start (String.length fp - start)
+      | None -> fp
+
+let edits_of_session ?(project_dir="") ~filepath () =
   let session_id = Filename.basename filepath |> Filename.chop_extension in
   let lines = read_lines filepath in
   let open Yojson.Safe.Util in
@@ -37,7 +82,11 @@ let edits_of_session ~filepath =
         ) items
   ) lines;
   (* Pass 2: track interaction boundaries, extract edits *)
-  let current_iidx = ref 0 in
+  (* Start at -1 so the first real user message takes idx 0, matching
+     [Jsonl_reader.parse_interactions] which numbers turns 0..N-1.
+     Previously we pre-incremented from 0, giving 1..N and making
+     edit_links.turn_idx one ahead of steps.turn_index. *)
+  let current_iidx = ref (-1) in
   let current_branch = ref "" in
   let edit_in_turn = ref 0 in
   let edits = ref [] in
@@ -100,7 +149,9 @@ let edits_of_session ~filepath =
                   let ek = make_edit_key ~file_base ~old_string ~new_string in
                   let eidx = !edit_in_turn in
                   incr edit_in_turn;
-                  edits := { edit_key = ek; file_base; new_string; old_string;
+                  let file_path = normalize_file_path ~project_dir fp in
+                  edits := { edit_key = ek; file_base; file_path;
+                             new_string; old_string;
                              replace_all; timestamp = ts; session_id;
                              interaction_index = !current_iidx;
                              turn_idx = !current_iidx; entry_idx = eidx;
@@ -125,7 +176,8 @@ let edits_of_sessions ~pool ~project_dir =
   let sessions = sort_by_size_desc (Urme_search.Jsonl_reader.list_sessions ~jsonl_dir) in
   Domainslib.Task.run pool (fun () ->
     let promises = List.map (fun filepath ->
-      Domainslib.Task.async pool (fun () -> edits_of_session ~filepath)
+      Domainslib.Task.async pool (fun () ->
+        edits_of_session ~project_dir ~filepath ())
     ) sessions in
     let all = List.concat_map (Domainslib.Task.await pool) promises in
     List.sort (fun a b -> Float.compare b.timestamp a.timestamp) all

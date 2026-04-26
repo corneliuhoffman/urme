@@ -3,3 +3,4 @@ _build/
 .merlin
 bin/experience-agent
 chroma/
+.urme/

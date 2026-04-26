@@ -1,4 +1,4 @@
-(executable
- (name test_engine)
- (libraries urme_engine urme_core urme_store urme_git urme_search
-            lwt lwt.unix domainslib yojson str))
+(executables
+ (names test_engine test_indexer test_prompts test_summarise test_search)
+ (libraries urme_engine urme_core urme_store urme_git urme_search urme_claude
+            lwt lwt.unix domainslib yojson str sqlite3 unix))

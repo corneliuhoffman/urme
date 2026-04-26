@@ -1,3 +1,3 @@
 (library
  (name urme_store)
- (libraries urme_core urme_git irmin-git.unix lwt))
+ (libraries urme_core urme_git irmin-git.unix lwt sqlite3 unix))

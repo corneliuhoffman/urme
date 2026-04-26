@@ -1,0 +1,104 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: arm64-darwin
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System deps
+        run: brew install sqlite libev pkg-config dylibbundler
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: '5.1'
+
+      - run: opam install --deps-only -y .
+
+      - run: opam exec -- dune build --profile release bin/main.exe
+
+      - name: Bundle dylibs
+        id: stage
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          tarball="urme-${version}-arm64-darwin.tar.gz"
+          mkdir -p dist/lib
+          cp _build/default/bin/main.exe dist/urme
+          chmod +x dist/urme
+          # Copy non-system dylibs into dist/lib/ and rewrite the
+          # binary's install names to @executable_path/lib/<dylib>.
+          # Brew's symlink in bin/ resolves @executable_path to the
+          # libexec location where we ship both urme and lib/.
+          dylibbundler -od -b -x dist/urme -d dist/lib -p '@executable_path/lib/'
+          tar -C dist -czf "$tarball" urme lib
+          shasum -a 256 "$tarball" | tee "$tarball.sha256"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.stage.outputs.tarball }}
+            ${{ steps.stage.outputs.tarball }}.sha256
+          generate_release_notes: true
+
+  linux:
+    name: x86_64-linux
+    runs-on: ubuntu-22.04
+    container:
+      image: ocaml/opam:alpine-3.19-ocaml-5.1
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System deps
+        run: |
+          apk add --no-cache \
+            build-base bash tar git \
+            libev-dev libev-static \
+            sqlite-dev sqlite-static \
+            gmp-dev gmp-static \
+            zlib-static \
+            openssl-libs-static \
+            pkgconfig
+
+      - name: Build static
+        shell: bash
+        run: |
+          # The ocaml/opam container has opam preconfigured.
+          # OCAMLPARAM injects -static at link time.
+          opam install -y --deps-only .
+          eval $(opam env)
+          OCAMLPARAM='_,cclib=-static' \
+            opam exec -- dune build --profile release bin/main.exe
+
+      - name: Stage tarball
+        id: stage
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          tarball="urme-${version}-x86_64-linux.tar.gz"
+          mkdir -p dist
+          cp _build/default/bin/main.exe dist/urme
+          chmod +x dist/urme
+          # Verify it's actually static.
+          file dist/urme
+          ldd dist/urme 2>&1 || true
+          tar -C dist -czf "$tarball" urme
+          sha256sum "$tarball" | tee "$tarball.sha256"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.stage.outputs.tarball }}
+            ${{ steps.stage.outputs.tarball }}.sha256
+          generate_release_notes: true

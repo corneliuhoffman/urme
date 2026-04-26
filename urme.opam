@@ -15,6 +15,8 @@ depends: [
   "patch" {>= "3.1"}
   "domainslib" {>= "0.5"}
   "conf-libev"
+  "sqlite3" {>= "5.0"}
+  "ocamlgraph" {>= "2.0"}
 ]
 build: [
   ["dune" "build" "-p" name "-j" jobs]
