@@ -21,7 +21,15 @@ jobs:
         with:
           ocaml-compiler: '5.1'
 
-      - run: opam install --deps-only -y .
+      - name: opam deps (with retry for transient 502s)
+        shell: bash
+        run: |
+          for i in 1 2 3 4 5; do
+            opam install --deps-only -y . && break
+            [ $i -eq 5 ] && { echo "opam install failed after 5 attempts"; exit 1; }
+            echo "opam install attempt $i/5 failed; sleeping 30s"
+            sleep 30
+          done
 
       - run: opam exec -- dune build --profile release bin/main.exe
 
@@ -32,8 +40,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           tarball="urme-${version}-arm64-darwin.tar.gz"
           mkdir -p dist/lib
-          cp _build/default/bin/main.exe dist/urme
-          chmod +x dist/urme
+          install -m 0755 _build/default/bin/main.exe dist/urme
           # Copy non-system dylibs into dist/lib/ and rewrite the
           # binary's install names to @executable_path/lib/<dylib>.
           # Brew's symlink in bin/ resolves @executable_path to the
@@ -67,7 +74,15 @@ jobs:
         with:
           ocaml-compiler: '5.1'
 
-      - run: opam install --deps-only -y .
+      - name: opam deps (with retry for transient 502s)
+        shell: bash
+        run: |
+          for i in 1 2 3 4 5; do
+            opam install --deps-only -y . && break
+            [ $i -eq 5 ] && { echo "opam install failed after 5 attempts"; exit 1; }
+            echo "opam install attempt $i/5 failed; sleeping 30s"
+            sleep 30
+          done
 
       - run: opam exec -- dune build --profile release bin/main.exe
 
@@ -78,8 +93,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           tarball="urme-${version}-x86_64-linux.tar.gz"
           mkdir -p dist/lib
-          cp _build/default/bin/main.exe dist/urme
-          chmod +x dist/urme
+          install -m 0755 _build/default/bin/main.exe dist/urme
           # Copy every non-system .so the binary needs into dist/lib/.
           # Skip the dynamic loader, glibc, and components universally
           # present on glibc-based distros.
