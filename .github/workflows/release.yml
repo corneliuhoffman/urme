@@ -53,46 +53,47 @@ jobs:
   linux:
     name: x86_64-linux
     runs-on: ubuntu-22.04
-    container:
-      image: ocaml/opam:alpine-3.19-ocaml-5.1
-      options: --user root
     steps:
       - uses: actions/checkout@v4
 
       - name: System deps
         run: |
-          apk add --no-cache \
-            build-base bash tar git \
-            libev-dev libev-static \
-            sqlite-dev sqlite-static \
-            gmp-dev gmp-static \
-            zlib-static \
-            openssl-libs-static \
-            pkgconfig
+          sudo apt-get update
+          sudo apt-get install -y \
+            libev-dev libsqlite3-dev libgmp-dev libssl-dev \
+            pkg-config patchelf
 
-      - name: Build static
-        shell: bash
-        run: |
-          # The ocaml/opam container has opam preconfigured.
-          # OCAMLPARAM injects -static at link time.
-          opam install -y --deps-only .
-          eval $(opam env)
-          OCAMLPARAM='_,cclib=-static' \
-            opam exec -- dune build --profile release bin/main.exe
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: '5.1'
 
-      - name: Stage tarball
+      - run: opam install --deps-only -y .
+
+      - run: opam exec -- dune build --profile release bin/main.exe
+
+      - name: Bundle .so files
         id: stage
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
           tarball="urme-${version}-x86_64-linux.tar.gz"
-          mkdir -p dist
+          mkdir -p dist/lib
           cp _build/default/bin/main.exe dist/urme
           chmod +x dist/urme
-          # Verify it's actually static.
+          # Copy every non-system .so the binary needs into dist/lib/.
+          # Skip the dynamic loader, glibc, and components universally
+          # present on glibc-based distros.
+          skip='^/lib64/ld-linux|^linux-vdso|/(libc|libm|libdl|libpthread|libgcc_s|librt|libresolv|libutil|libstdc\+\+)\.so'
+          ldd dist/urme | awk '/=> \// {print $3}' | sort -u \
+            | grep -Ev "$skip" \
+            | xargs -I{} cp -L {} dist/lib/
+          # Set RPATH so the binary resolves bundled libs first.
+          patchelf --set-rpath '$ORIGIN/lib' dist/urme
+          echo "--- after bundling ---"
           file dist/urme
-          ldd dist/urme 2>&1 || true
-          tar -C dist -czf "$tarball" urme
+          ldd dist/urme
+          ls -lh dist/lib/
+          tar -C dist -czf "$tarball" urme lib
           sha256sum "$tarball" | tee "$tarball.sha256"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
 
