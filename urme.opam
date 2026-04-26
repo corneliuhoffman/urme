@@ -14,15 +14,15 @@ depends: [
   "yojson" {>= "2.0"}
   "cohttp-lwt-unix" {>= "5.0"}
   "lwt" {>= "5.6"}
-  "uuidm" {>= "0.9"}
   "irmin-git" {>= "3.6"}
   "cmdliner" {>= "1.2"}
   "notty" {>= "0.2"}
+  "nottui"
+  "lwd"
   "patch" {>= "3.1"}
   "domainslib" {>= "0.5"}
   "conf-libev"
   "sqlite3" {>= "5.0"}
-  "ocamlgraph" {>= "2.0"}
 ]
 build: [
   ["dune" "build" "-p" name "-j" jobs]
