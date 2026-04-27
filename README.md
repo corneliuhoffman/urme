@@ -18,8 +18,9 @@ For source builds, see [Build from source](#build-from-source) below.
 ```sh
 cd ~/some/repo-where-you-use-claude-code   # any repo with .claude/ session JSONLs
 
-urme init -j 8                                  # one-time: index every JSONL into .urme/db.sqlite (optionally in parallel)
-                                            # (also walks git, links Claude edits to commits)
+urme init -j 8                                  # one-time: index every JSONL into .urme/db.sqlite
+                                                # (optionally in parallel)
+                                                # (also walks git, links Claude edits to commits)
 
 urme                                        # open the TUI — search, replay, view per-turn diffs
 ```
