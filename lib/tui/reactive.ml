@@ -34,11 +34,12 @@ let dbg msg =
   with _ -> ()
 
 type link = Urme_engine.Git_link_types.link
-type focus = Branches | Commits | Files | Links
-type hist_focus = Sessions | Turns
+type focus = Branches | Commits | Files | Links | Right
+type right_kind = Right_link | Right_diff
+type hist_focus = Sessions | Turns | History_body
 type hist_view = Overview | Body
 type mode = Git | History | Search
-type search_focus = Query | Results
+type search_focus = Query | Synthesis | Results | Body
 
 type turn_info = {
   t_turn_idx   : int;
@@ -179,6 +180,7 @@ type state = {
   mode         : mode Lwd.var;
   (* git mode *)
   focus        : focus Lwd.var;
+  right_kind   : right_kind Lwd.var;
   branch_idx   : int Lwd.var;
   commit_idx   : int Lwd.var;
   file_idx     : int Lwd.var;
@@ -205,6 +207,7 @@ type state = {
   search_view    : hist_view Lwd.var;
   search_turn_offset : int Lwd.var;
   search_synthesis   : string Lwd.var;
+  search_synth_scroll : int Lwd.var;
   (* Filled in by [root] once config is loaded. *)
   mutable run_search : (string -> unit);
   quit_u       : unit Lwt.u;
@@ -461,6 +464,55 @@ let display_width s =
        else 4)
   done;
   !cells
+
+(* Word-wrap [s] into a list of strings, each at most [cells] display
+   cells wide. Breaks on ASCII spaces; if a single word exceeds [cells]
+   it is hard-cut on a UTF-8 byte boundary. Empty input returns [""]. *)
+let wrap_to_cells s cells =
+  if cells <= 0 then [s]
+  else if display_width s <= cells then [s]
+  else
+    let words = String.split_on_char ' ' s in
+    let lines = ref [] in
+    let cur = Buffer.create 64 in
+    let cur_w = ref 0 in
+    let flush () =
+      lines := Buffer.contents cur :: !lines;
+      Buffer.clear cur;
+      cur_w := 0 in
+    let add_word w =
+      let ww = display_width w in
+      if ww > cells then begin
+        if !cur_w > 0 then flush ();
+        let n = String.length w in
+        let i = ref 0 in
+        while !i < n do
+          let take = ref (min cells (n - !i)) in
+          while !i + !take < n
+                && (let c = Char.code w.[!i + !take] in
+                    c >= 0x80 && c < 0xc0)
+          do decr take done;
+          let chunk = String.sub w !i !take in
+          if !i + !take < n then lines := chunk :: !lines
+          else begin
+            Buffer.add_string cur chunk;
+            cur_w := display_width chunk
+          end;
+          i := !i + !take
+        done
+      end else begin
+        let need = if !cur_w = 0 then ww else ww + 1 in
+        if !cur_w + need > cells then flush ();
+        if !cur_w > 0 then begin
+          Buffer.add_char cur ' ';
+          incr cur_w
+        end;
+        Buffer.add_string cur w;
+        cur_w := !cur_w + ww
+      end in
+    List.iter add_word words;
+    if Buffer.length cur > 0 || !lines = [] then flush ();
+    List.rev !lines
 
 (* Pad / truncate a string to exactly [cells] display cells. Truncates
    conservatively (one cell early so there's room for the "…" marker
@@ -783,9 +835,11 @@ let links_panel s =
 let cycle_focus ?(back=false) f =
   match back, f with
   | false, Branches -> Commits | false, Commits -> Files
-  | false, Files -> Links    | false, Links -> Branches
-  | true,  Branches -> Links   | true,  Commits -> Branches
+  | false, Files -> Links    | false, Links -> Right
+  | false, Right -> Branches
+  | true,  Branches -> Right   | true,  Commits -> Branches
   | true,  Files -> Commits  | true,  Links -> Files
+  | true,  Right -> Links
 
 let nav s delta =
   let clamp n i = max 0 (min (max 0 (n - 1)) i) in
@@ -825,6 +879,7 @@ let nav s delta =
          | Some l -> List.length l | None -> 0)
       | None -> 0 in
     Lwd.update (fun i -> clamp links_n (i + delta)) s.link_idx
+  | Right -> ()  (* Right pane uses delta to scroll, handled directly *)
 
 let hist_nav s delta =
   let n = List.length s.data.sessions in
@@ -868,7 +923,7 @@ let on_key s (key, _mods) : U.may_handle =
   match Lwd.peek s.mode, key with
   (* Mode switches — except when typing in the search query field. *)
   | (Git | History), `ASCII 'q' -> Lwt.wakeup_later s.quit_u (); `Handled
-  | Search, `ASCII 'q' when Lwd.peek s.search_focus = Results ->
+  | Search, `ASCII 'q' when Lwd.peek s.search_focus <> Query ->
     Lwt.wakeup_later s.quit_u (); `Handled
   | Git, `ASCII 'h' -> defer (fun () -> Lwd.set s.mode History)
   | Git, `ASCII 's' -> defer (fun () ->
@@ -878,19 +933,20 @@ let on_key s (key, _mods) : U.may_handle =
   | History, `ASCII 's' -> defer (fun () ->
       Lwd.set s.mode Search;
       Lwd.set s.search_focus Query)
-  | Search, `ASCII 'g' when Lwd.peek s.search_focus = Results ->
+  | Search, `ASCII 'g' when Lwd.peek s.search_focus <> Query ->
     defer (fun () -> Lwd.set s.mode Git)
-  | Search, `ASCII 'h' when Lwd.peek s.search_focus = Results ->
+  | Search, `ASCII 'h' when Lwd.peek s.search_focus <> Query ->
     defer (fun () -> Lwd.set s.mode History)
-  (* Pressing [s] while in Results wipes the current search and
+  (* Pressing [s] outside the query field wipes the current search and
      puts focus back in the query field, ready for a new query. *)
-  | Search, `ASCII 's' when Lwd.peek s.search_focus = Results ->
+  | Search, `ASCII 's' when Lwd.peek s.search_focus <> Query ->
     defer (fun () ->
       Lwd.set s.search_query ("", 0);
       Lwd.set s.search_hits [];
       Lwd.set s.search_synthesis "";
       Lwd.set s.search_idx 0;
       Lwd.set s.search_scroll 0;
+      Lwd.set s.search_synth_scroll 0;
       Lwd.set s.search_view Overview;
       Lwd.set s.search_turn_offset 0;
       Lwd.set s.search_focus Query)
@@ -916,17 +972,37 @@ let on_key s (key, _mods) : U.may_handle =
         Lwd.set s.search_query (q', String.length q'))
     end
   | Search, `Arrow `Down when Lwd.peek s.search_focus = Query ->
-    defer (fun () ->
-      if Lwd.peek s.search_hits <> [] then
-        Lwd.set s.search_focus Results)
-  (* ---- Navigation-only keys (only meaningful in Results) ---- *)
+    defer (fun () -> Lwd.set s.search_focus Synthesis)
+  (* ---- Navigation-only keys (only meaningful outside Query) ---- *)
   | Search, `Tab -> defer (fun () ->
-      Lwd.update (function Query -> Results | Results -> Query)
+      Lwd.update (function
+        | Query -> Synthesis
+        | Synthesis -> Results
+        | Results -> Body
+        | Body -> Synthesis)
         s.search_focus)
-  | Search, `ASCII '/' when Lwd.peek s.search_focus = Results ->
+  | Search, `ASCII '/' when Lwd.peek s.search_focus <> Query ->
     defer (fun () -> Lwd.set s.search_focus Query)
-  | Search, `ASCII 'i' when Lwd.peek s.search_focus = Results ->
+  | Search, `ASCII 'i' when Lwd.peek s.search_focus <> Query ->
     defer (fun () -> Lwd.set s.search_focus Query)
+  (* Synthesis pane scroll *)
+  | Search, `Arrow `Down when Lwd.peek s.search_focus = Synthesis ->
+    defer (fun () -> Lwd.update (fun i -> i + 1) s.search_synth_scroll)
+  | Search, `Arrow `Up when Lwd.peek s.search_focus = Synthesis ->
+    defer (fun () -> Lwd.update (fun i -> max 0 (i - 1)) s.search_synth_scroll)
+  | Search, `ASCII 'j' when Lwd.peek s.search_focus = Synthesis ->
+    defer (fun () -> Lwd.update (fun i -> i + 1) s.search_synth_scroll)
+  | Search, `ASCII 'k' when Lwd.peek s.search_focus = Synthesis ->
+    defer (fun () -> Lwd.update (fun i -> max 0 (i - 1)) s.search_synth_scroll)
+  (* Body pane scroll *)
+  | Search, `Arrow `Down when Lwd.peek s.search_focus = Body ->
+    defer (fun () -> Lwd.update (fun i -> i + 1) s.search_scroll)
+  | Search, `Arrow `Up when Lwd.peek s.search_focus = Body ->
+    defer (fun () -> Lwd.update (fun i -> max 0 (i - 1)) s.search_scroll)
+  | Search, `ASCII 'j' when Lwd.peek s.search_focus = Body ->
+    defer (fun () -> Lwd.update (fun i -> i + 1) s.search_scroll)
+  | Search, `ASCII 'k' when Lwd.peek s.search_focus = Body ->
+    defer (fun () -> Lwd.update (fun i -> max 0 (i - 1)) s.search_scroll)
   | Search, `Arrow `Down when Lwd.peek s.search_focus = Results ->
     defer (fun () ->
       let n = List.length (Lwd.peek s.search_hits) in
@@ -968,18 +1044,24 @@ let on_key s (key, _mods) : U.may_handle =
     defer (fun () -> Lwd.update (fun i -> i + 20) s.search_scroll)
   | Search, `ASCII 'K' when Lwd.peek s.search_focus = Results ->
     defer (fun () -> Lwd.update (fun i -> max 0 (i - 20)) s.search_scroll)
-  | Search, `Enter when Lwd.peek s.search_focus = Results ->
+  | Search, `Enter
+    when Lwd.peek s.search_focus = Results
+      || Lwd.peek s.search_focus = Body ->
     defer (fun () ->
       let v = Lwd.peek s.search_view in
-      dbg (Printf.sprintf "Search Enter focus=Results view=%s"
+      dbg (Printf.sprintf "Search Enter view=%s"
              (match v with Overview -> "Overview" | Body -> "Body"));
       Lwd.update (function Overview -> Body | Body -> Overview) s.search_view;
       Lwd.set s.search_scroll 0)
-  | Search, `Arrow `Right when Lwd.peek s.search_focus = Results ->
+  | Search, `Arrow `Right
+    when Lwd.peek s.search_focus = Results
+      || Lwd.peek s.search_focus = Body ->
     defer (fun () ->
       Lwd.update (fun i -> i + 1) s.search_turn_offset;
       Lwd.set s.search_scroll 0)
-  | Search, `Arrow `Left when Lwd.peek s.search_focus = Results ->
+  | Search, `Arrow `Left
+    when Lwd.peek s.search_focus = Results
+      || Lwd.peek s.search_focus = Body ->
     defer (fun () ->
       Lwd.update (fun i -> i - 1) s.search_turn_offset;
       Lwd.set s.search_scroll 0)
@@ -992,34 +1074,51 @@ let on_key s (key, _mods) : U.may_handle =
       else if Lwd.peek s.search_view = Body
       then (Lwd.set s.search_view Overview; Lwd.set s.search_scroll 0)
       else Lwd.set s.search_focus Query)
-  (* Git mode: arrows move left panels, j/k scroll the diff/turn,
-     J/K page, ←/→ step through turns when on Links, Enter toggles
-     overview/body when on Links. *)
+  (* Git mode: arrows move within the focused pane (selection on the
+     left panes, scrolling on the right pane). [j]/[k]/[J]/[K] always
+     scroll the right pane regardless of focus, kept for muscle
+     memory. *)
   | Git, `Tab -> defer (fun () ->
-      Lwd.update cycle_focus s.focus;
-      Lwd.set s.diff_scroll 0;
+      let prev = Lwd.peek s.focus in
+      let next = cycle_focus prev in
+      (match prev with
+       | Branches | Commits | Files -> Lwd.set s.right_kind Right_diff
+       | Links -> Lwd.set s.right_kind Right_link
+       | Right -> ());
+      Lwd.set s.focus next;
+      if next <> Right then Lwd.set s.diff_scroll 0;
       Lwd.set s.link_turn_offset 0)
+  | Git, `Arrow `Down when Lwd.peek s.focus = Right ->
+    defer (fun () -> Lwd.update (fun i -> i + 1) s.diff_scroll)
+  | Git, `Arrow `Up when Lwd.peek s.focus = Right ->
+    defer (fun () -> Lwd.update (fun i -> max 0 (i - 1)) s.diff_scroll)
   | Git, `Arrow `Down -> defer (fun () ->
       nav s 1; Lwd.set s.diff_scroll 0; Lwd.set s.link_turn_offset 0)
   | Git, `Arrow `Up -> defer (fun () ->
       nav s (-1); Lwd.set s.diff_scroll 0; Lwd.set s.link_turn_offset 0)
   | Git, `Arrow `Right
-    when (Lwd.peek s.focus = Links) ->
+    when Lwd.peek s.focus = Right
+      && Lwd.peek s.right_kind = Right_link ->
     defer (fun () ->
       Lwd.update (fun i -> i + 1) s.link_turn_offset;
       Lwd.set s.diff_scroll 0)
   | Git, `Arrow `Left
-    when (Lwd.peek s.focus = Links) ->
+    when Lwd.peek s.focus = Right
+      && Lwd.peek s.right_kind = Right_link ->
     defer (fun () ->
       Lwd.update (fun i -> i - 1) s.link_turn_offset;
       Lwd.set s.diff_scroll 0)
   | Git, `Enter
-    when (Lwd.peek s.focus = Links) ->
+    when Lwd.peek s.focus = Links
+      || (Lwd.peek s.focus = Right
+          && Lwd.peek s.right_kind = Right_link) ->
     defer (fun () ->
       Lwd.update (function Overview -> Body | Body -> Overview) s.hist_view;
       Lwd.set s.diff_scroll 0)
   | Git, `Escape
-    when (Lwd.peek s.focus = Links) ->
+    when Lwd.peek s.focus = Links
+      || (Lwd.peek s.focus = Right
+          && Lwd.peek s.right_kind = Right_link) ->
     defer (fun () ->
       Lwd.set s.link_turn_offset 0;
       Lwd.set s.diff_scroll 0)
@@ -1044,39 +1143,37 @@ let on_key s (key, _mods) : U.may_handle =
     defer (fun () -> Lwd.set s.hist_view Overview; Lwd.set s.hist_scroll 0)
   | History, `Tab ->
     defer (fun () ->
-      Lwd.update (function Sessions -> Turns | Turns -> Sessions) s.hist_focus)
-  (* In Overview: j/k navigates session/turn. In Body: j/k scrolls
-     the text, J/K page-scrolls. Arrow keys always navigate. *)
-  (* Arrows always navigate the list (sessions/turns), in both
-     Overview and Body view — matches git-links behaviour where
-     ↑/↓ move selection and the right panel auto-updates. Use
-     j/k / J/K to scroll the body. *)
+      Lwd.update (function
+        | Sessions -> Turns
+        | Turns -> History_body
+        | History_body -> Sessions) s.hist_focus)
+  (* Arrow keys move within the focused pane: selection on the
+     Sessions/Turns lists, scroll on the Body pane. [j]/[k]/[J]/[K]
+     mirror this. *)
   | History, `Arrow `Down ->
     defer (fun () ->
       match Lwd.peek s.hist_focus with
       | Sessions -> hist_nav s 1
-      | Turns -> hist_turn_nav s 1)
+      | Turns -> hist_turn_nav s 1
+      | History_body -> Lwd.update (fun i -> i + 1) s.hist_scroll)
   | History, `Arrow `Up ->
     defer (fun () ->
       match Lwd.peek s.hist_focus with
       | Sessions -> hist_nav s (-1)
-      | Turns -> hist_turn_nav s (-1))
+      | Turns -> hist_turn_nav s (-1)
+      | History_body -> Lwd.update (fun i -> max 0 (i - 1)) s.hist_scroll)
   | History, `ASCII 'j' ->
     defer (fun () ->
-      match Lwd.peek s.hist_view with
-      | Overview ->
-        (match Lwd.peek s.hist_focus with
-         | Sessions -> hist_nav s 1
-         | Turns -> hist_turn_nav s 1)
-      | Body -> Lwd.update (fun i -> i + 1) s.hist_scroll)
+      match Lwd.peek s.hist_focus with
+      | Sessions -> hist_nav s 1
+      | Turns -> hist_turn_nav s 1
+      | History_body -> Lwd.update (fun i -> i + 1) s.hist_scroll)
   | History, `ASCII 'k' ->
     defer (fun () ->
-      match Lwd.peek s.hist_view with
-      | Overview ->
-        (match Lwd.peek s.hist_focus with
-         | Sessions -> hist_nav s (-1)
-         | Turns -> hist_turn_nav s (-1))
-      | Body -> Lwd.update (fun i -> max 0 (i - 1)) s.hist_scroll)
+      match Lwd.peek s.hist_focus with
+      | Sessions -> hist_nav s (-1)
+      | Turns -> hist_turn_nav s (-1)
+      | History_body -> Lwd.update (fun i -> max 0 (i - 1)) s.hist_scroll)
   | History, `ASCII 'J' ->
     defer (fun () ->
       if Lwd.peek s.hist_view = Body then
@@ -1089,6 +1186,14 @@ let on_key s (key, _mods) : U.may_handle =
     defer (fun () -> Lwd.update (fun i -> max 0 (i - 1)) s.hist_scroll)
   | History, `ASCII ']' ->
     defer (fun () -> Lwd.update (fun i -> i + 1) s.hist_scroll)
+  (* Left/Right step prev/next turn from any pane that is currently
+     showing a turn body (Turns selection or History_body). *)
+  | History, `Arrow `Right
+    when Lwd.peek s.hist_focus = History_body ->
+    defer (fun () -> hist_turn_nav s 1)
+  | History, `Arrow `Left
+    when Lwd.peek s.hist_focus = History_body ->
+    defer (fun () -> hist_turn_nav s (-1))
   | _ -> `Unhandled
 
 (* -------- Root UI -------- *)
@@ -1697,8 +1802,16 @@ let styled_panel ?(idx=5) ?(title_text="") ?(focused=Lwd.pure false)
         let body_h = max 0 (h - 2) in
         let rec drop n xs = if n <= 0 then xs
           else match xs with [] -> [] | _ :: r -> drop (n - 1) r in
-        let visible = drop scroll lines in
-        let total = List.length lines in
+        (* Soft-wrap each input line to the panel's inner width
+           (minus the 2-cell indent that [make_row] prepends). Each
+           wrapped fragment becomes its own row, inheriting the
+           source line's attr. *)
+        let wrap_w = max 1 (inner_w - 2) in
+        let wrapped = List.concat_map (fun (attr, l) ->
+          let pieces = wrap_to_cells (sanitize l) wrap_w in
+          List.map (fun p -> (attr, p)) pieces) lines in
+        let visible = drop scroll wrapped in
+        let total = List.length wrapped in
         let label = Printf.sprintf "[%d]─%s" idx title_text in
         let lbl_cells = display_width label in
         let fill_n = max 0 (inner_w - lbl_cells - 1) in
@@ -1724,7 +1837,7 @@ let styled_panel ?(idx=5) ?(title_text="") ?(focused=Lwd.pure false)
             I.string border_attr "│";
           ] in
         let make_row (attr, l) =
-          let content = pad_cells ("  " ^ sanitize l) inner_w in
+          let content = pad_cells ("  " ^ l) inner_w in
           I.hcat [
             I.string border_attr "│";
             I.string attr content;
@@ -1746,18 +1859,19 @@ let styled_panel ?(idx=5) ?(title_text="") ?(focused=Lwd.pure false)
       (U.resize ~w:0 ~h:0 ~sw:1 ~sh:1 ui))
 
 let history_body_panel s =
-  let focused = Lwd.pure true in
+  let focused = Lwd.map (Lwd.get s.hist_focus) ~f:(fun f -> f = History_body) in
   let ui =
     styled_panel ~idx:3 ~focused ~title_text:"Turn"
       (current_turn_styled s) s.hist_scroll in
   with_mouse ui
-    ~on_click:(fun () -> ())
+    ~on_click:(fun () -> Lwd.set s.hist_focus History_body)
     ~on_scroll:(fun d ->
+      Lwd.set s.hist_focus History_body;
       Lwd.update (fun i -> max 0 (i + d)) s.hist_scroll)
 
 (* Diff panel — reuses [styled_panel] with diff-colour-attr per line. *)
 let diff_panel s =
-  let focused = Lwd.map (Lwd.get s.focus) ~f:(fun f -> f = Links) in
+  let focused = Lwd.map (Lwd.get s.focus) ~f:(fun f -> f = Right) in
   let styled_lines = Lwd.map (Lwd.get s.current_diff) ~f:(fun text ->
     let attr_for l =
       if String.length l = 0 then A.(fg c_fg_main)
@@ -1881,7 +1995,7 @@ let link_turn_styled s : (Notty.A.t * string) list Lwd.t =
           ~turn_idx:(link.turn_idx + offset) ())
 
 let link_panel s =
-  let focused = Lwd.map (Lwd.get s.focus) ~f:(fun f -> f = Links) in
+  let focused = Lwd.map (Lwd.get s.focus) ~f:(fun f -> f = Right) in
   let label =
     Lwd.map (Lwd.get s.link_turn_offset) ~f:(fun off ->
       if off = 0 then "Link turn"
@@ -1932,11 +2046,24 @@ let link_body_scroll_driver s =
       U.empty)
 
 let right_panel s =
-  let inner = Lwd.bind (Lwd.get s.focus) ~f:(fun f ->
-    if f = Links then link_panel s else diff_panel s) in
+  (* Right pane content follows [right_kind] (Link list vs. diff/turn
+     body). [focus = Right] just means the right pane is the
+     scroll target — it doesn't change what's displayed. *)
+  let inner = Lwd.bind
+    (Lwd.map2 (Lwd.get s.focus) (Lwd.get s.right_kind)
+       ~f:(fun f rk -> (f, rk)))
+    ~f:(fun (f, rk) ->
+      let show_link = match f, rk with
+        | Links, _ -> true
+        | Right, Right_link -> true
+        | _ -> false in
+      if show_link then link_panel s else diff_panel s) in
   with_mouse inner
-    ~on_click:(fun () -> Lwd.set s.focus Links)
+    ~on_click:(fun () ->
+      (* Clicking the right pane focuses it; preserve current right_kind. *)
+      Lwd.set s.focus Right)
     ~on_scroll:(fun d ->
+      Lwd.set s.focus Right;
       Lwd.update (fun i -> max 0 (i + d)) s.diff_scroll)
 
 (* -------- Search mode -------- *)
@@ -2058,7 +2185,7 @@ let search_body_styled s : (Notty.A.t * string) list Lwd.t =
               ~turn_idx:effective_turn ())
 
 let search_body_panel s =
-  let focused = Lwd.map (Lwd.get s.search_focus) ~f:(fun f -> f = Results) in
+  let focused = Lwd.map (Lwd.get s.search_focus) ~f:(fun f -> f = Body) in
   let label =
     Lwd.map2 (Lwd.get s.search_view) (Lwd.get s.search_turn_offset)
       ~f:(fun v off ->
@@ -2069,35 +2196,16 @@ let search_body_panel s =
     styled_panel ~idx:3 ~focused ~title_text:title
       (search_body_styled s) s.search_scroll) in
   with_mouse ui
-    ~on_click:(fun () -> ())
+    ~on_click:(fun () -> Lwd.set s.search_focus Body)
     ~on_scroll:(fun d ->
+      Lwd.set s.search_focus Body;
       Lwd.update (fun i -> max 0 (i + d)) s.search_scroll)
 
 (* Query bar + info strip at top of search view. Uses nottui's
    [edit_field]. Submitting (Enter while Query-focused) fires off a
    background search; results come back via Lwt.async → Lwd.set. *)
 (* No edit_field. The query is just text painted from [search_query];
-   editing is done entirely through [on_key] when [search_focus = Query].
-   This matches git-links: once the search has run, the tree is a pair
-   of static panels (Results + Body) identical to the Links/Link-turn
-   layout — no focus juggling, no embedded keyboard areas. *)
-let search_query_bar s =
-  (* The query text itself is already rendered in the top pane — this
-     bar is just a one-line status/keybind hint. *)
-  Lwd.map2 (Lwd.get s.search_focus) (Lwd.get s.search_running)
-    ~f:(fun focus running ->
-      let msg =
-        if running then
-          ("  ●  searching…  ", A.(fg c_hunk ++ st italic))
-        else match focus with
-          | Query ->
-            ("  editing query — Enter: run   Esc: back   Backspace: delete  ",
-             A.(fg c_hunk ++ st bold))
-          | Results ->
-            ("  results — ↑/↓ nav   Enter body/overview   ←/→ prev/next turn   /  edit query   s: new search  ",
-             A.(fg (gray 14))) in
-      let (text, attr) = msg in
-      U.atom (I.string attr text))
+   editing is done entirely through [on_key] when [search_focus = Query]. *)
 
 let search_synthesis_panel s =
   let selected =
@@ -2137,13 +2245,17 @@ let search_synthesis_panel s =
              push A.(fg c_fg_main)
                "Type a query below, press Enter to search.");
         List.rev !rows) in
-  let dummy = Lwd.var 0 in
-  styled_panel ~idx:1 ~title_text:"Search"
-    ~focused:(Lwd.pure false) lines_lwd dummy
+  let focused = Lwd.map (Lwd.get s.search_focus) ~f:(fun f -> f = Synthesis) in
+  let ui = styled_panel ~idx:1 ~title_text:"Search"
+    ~focused lines_lwd s.search_synth_scroll in
+  with_mouse ui
+    ~on_click:(fun () -> Lwd.set s.search_focus Synthesis)
+    ~on_scroll:(fun d ->
+      Lwd.set s.search_focus Synthesis;
+      Lwd.update (fun i -> max 0 (i + d)) s.search_synth_scroll)
 
 let search_view s ~run_search:_ =
   let top = search_synthesis_panel s in
-  let bottom = search_query_bar s in
   let left = search_results_panel s in
   let right = search_body_panel s in
   let split =
@@ -2175,14 +2287,9 @@ let search_view s ~run_search:_ =
         min 20 (max 6 n)) in
   let top_sized = Lwd.map2 top top_h ~f:(fun ui h ->
     U.resize ~w:0 ~h ~sw:1 ~sh:0 ui) in
-  Lwd.map2
-    (Lwd.map2 top_sized split ~f:(fun a b -> (a, b)))
-    bottom
-    ~f:(fun (t, m) b ->
-      U.join_y t
-        (U.join_y
-           (U.resize ~w:0 ~h:0 ~sw:1 ~sh:1 m)
-           (U.resize ~w:0 ~h:1 ~sw:1 ~sh:0 b)))
+  Lwd.map2 top_sized split ~f:(fun t m ->
+    U.join_y t
+      (U.resize ~w:0 ~h:0 ~sw:1 ~sh:1 m))
 
 (* Minimal reactivity diagnostic: a counter that redraws whenever a
    key is pressed. If this doesn't update either, the problem is in
@@ -2216,6 +2323,7 @@ let root s : U.t Lwd.t =
     Lwd.set s.search_running true;
     Lwd.set s.search_idx 0;
     Lwd.set s.search_scroll 0;
+    Lwd.set s.search_synth_scroll 0;
     Lwd.set s.search_view Overview;
     Lwd.set s.search_turn_offset 0;
     Lwd.set s.search_synthesis "";
@@ -2273,24 +2381,61 @@ Lwd.map2 left right ~f:(fun l r ->
     | History -> history_view
     | Search -> search_view_ui) in
   let status =
-    Lwd.map2
-      (Lwd.pair (Lwd.get s.mode) (Lwd.get s.focus))
-      (Lwd.pair (Lwd.get s.hist_view) (Lwd.get s.hist_focus))
-      ~f:(fun (mode, focus) (view, _hfocus) ->
-        let text = match mode, focus, view with
-          | Git, Links, _ ->
-            " [Git] Tab panel  ↑/↓ nav  ←/→ prev/next turn  Enter body/overview  Esc back  j/k scroll  h history  s search  q quit "
-          | Git, _, _ ->
-            " [Git] Tab panel  ↑/↓ nav  j/k diff scroll  J/K page  h history  s search  q quit "
-          | History, _, Overview ->
-            " [History] ↑/↓ nav  Tab panel  Enter body  g git  s search  q quit "
-          | History, _, Body ->
-            " [History] ↑/↓ prev/next turn  j/k scroll  J/K page  Enter back  g git  s search  q quit "
-          | Search, _, _ ->
-            " [Search] Enter run / body-overview  ↑/↓ nav  ←/→ prev/next turn  Tab focus  / or i edit query  Esc back  g git  h history  q quit "
+    let inputs =
+      Lwd.map2
+        (Lwd.pair (Lwd.get s.mode) (Lwd.get s.focus))
+        (Lwd.pair
+           (Lwd.pair (Lwd.get s.hist_view) (Lwd.get s.hist_focus))
+           (Lwd.pair (Lwd.get s.search_focus) (Lwd.get s.right_kind)))
+        ~f:(fun (m, f) ((hv, hf), (sf, rk)) -> (m, f, hv, hf, sf, rk)) in
+    let text_lwd = Lwd.map inputs
+      ~f:(fun (mode, focus, _hview, hfocus, sfocus, rkind) ->
+        let join parts =
+          String.concat " · " (List.filter (fun s -> s <> "") parts) in
+        let mode_tail = match mode with
+          | Git -> "Tab pane · h:hist · s:search · q:quit"
+          | History -> "Tab pane · g:git · s:search · q:quit"
+          | Search -> "Tab pane · /:edit · s:new · g:git · h:hist · q:quit"
         in
-        U.resize ~sw:1 ~h:1 ~sh:0
-          (U.atom (I.string A.(fg lightgreen) text))) in
+        let nav_or_scroll = match mode, focus, hfocus, sfocus with
+          | Git, Right, _, _
+          | History, _, History_body, _
+          | Search, _, _, Synthesis
+          | Search, _, _, Body -> "↑↓ scroll"
+          | _ -> "↑↓ nav"
+        in
+        let enter_hint = match mode, focus, hfocus, sfocus with
+          | Git, Links, _, _ -> "↵ toggle"
+          | Git, Right, _, _ when rkind = Right_link -> "↵ toggle"
+          | History, _, Turns, _
+          | History, _, History_body, _ -> "↵ toggle"
+          | Search, _, _, Results
+          | Search, _, _, Body -> "↵ toggle"
+          | Search, _, _, Query -> "↵ run"
+          | _ -> ""
+        in
+        let lr_hint = match mode, focus, hfocus, sfocus with
+          | Git, Right, _, _ when rkind = Right_link -> "←→ turn"
+          | History, _, History_body, _ -> "←→ turn"
+          | Search, _, _, Results
+          | Search, _, _, Body -> "←→ turn"
+          | _ -> ""
+        in
+        join [nav_or_scroll; lr_hint; enter_hint; mode_tail]) in
+    let w_var = Lwd.var 80 in
+    let sensor : U.size_sensor = fun ~w ~h:_ ->
+      if Lwd.peek w_var <> w then
+        Lwt.async (fun () ->
+          if Lwd.peek w_var <> w then Lwd.set w_var w;
+          Lwt.return_unit) in
+    let body = Lwd.map2 text_lwd (Lwd.get w_var) ~f:(fun text w ->
+      let cells = max 10 (w - 2) in
+      let lines = wrap_to_cells text cells in
+      let imgs = List.map (fun l ->
+        I.string A.(fg lightgreen) (" " ^ l)) lines in
+      let h = max 1 (List.length lines) in
+      U.resize ~sw:1 ~h ~sh:0 (U.atom (I.vcat imgs))) in
+    Lwd.map body ~f:(fun ui -> U.size_sensor sensor ui) in
   let drivers =
     Lwd.map (W.zbox
                [commits_driver s; content_driver s;
@@ -2329,6 +2474,7 @@ let run ~project_dir () =
     data;
     mode         = Lwd.var Git;
     focus        = Lwd.var Branches;
+    right_kind   = Lwd.var Right_diff;
     branch_idx   = Lwd.var 0;
     commit_idx   = Lwd.var 0;
     file_idx     = Lwd.var 0;
@@ -2351,6 +2497,7 @@ let run ~project_dir () =
     search_view    = Lwd.var Overview;
     search_turn_offset = Lwd.var 0;
     search_synthesis   = Lwd.var "";
+    search_synth_scroll = Lwd.var 0;
     run_search         = (fun _ -> ());
     quit_u;
   } in
@@ -2404,6 +2551,7 @@ let run ~project_dir () =
          Lwd.set s.search_query ("", 0);
          Lwd.set s.search_idx 0;
          Lwd.set s.search_scroll 0;
+         Lwd.set s.search_synth_scroll 0;
          Lwd.set s.search_view Overview;
          Lwd.set s.search_turn_offset 0;
          Lwd.set s.search_running false;

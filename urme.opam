@@ -1,6 +1,6 @@
 opam-version: "2.0"
 name: "urme"
-version: "0.1.1"
+version: "0.1.2"
 synopsis: "OCaml CLI orchestration layer for Claude + GitHub"
 maintainer: "corneliuhoffman@gmail.com"
 authors: ["Corneliu Hoffman <corneliuhoffman@gmail.com>"]
