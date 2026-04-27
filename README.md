@@ -1,4 +1,3 @@
-<img width="1918" height="1055" alt="Screenshot 2026-04-27 at 08 56 56" src="https://github.com/user-attachments/assets/86c35839-ef6b-4744-8bdb-17fe1e900d82" />
 # urme (romanian for traces)
 
 OCaml TUI + MCP server for linking git history to Claude Code conversations.
