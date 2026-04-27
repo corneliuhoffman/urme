@@ -1,4 +1,4 @@
-# urme
+# urme (romanian for traces)
 
 OCaml TUI + MCP server for linking git history to Claude Code conversations.
 Browse commits, see which Claude edits explain each diff, detect human
@@ -56,18 +56,25 @@ Or per-project in `.mcp.json`:
 }
 ```
 
-Tools Claude can then call: `search_history`, `get_turn`, `push_synthesis`, `file_history`, `region_blame`, `explain_change`, `commit_links`, `search_by_file`.
+Tools Claude can then call: `search_history`, `get_turn`, `push_synthesis`, `file_history`, `explain_change`, `commit_links`, `search_by_file`.
+
+## Suggested use
+
+It is meant to be used in a split pane with Claude code. Questions with "using urme ...." will push stuff into the urme pane and therefore you will be able to follow the interaction with Claude
+that generated the changes.
+<img width="1910" height="1069" alt="Screenshot 2026-04-27 at 08 54 43" src="https://github.com/user-attachments/assets/0cd9c628-b3d1-4da5-9a65-1b512375252a" />
+
 
 ## How it works
 
-urme is a single binary backed by a local SQLite store (`.urme/db.sqlite` at the project root). No external services — no ChromaDB, no Ollama, no vector embeddings.
+urme is a single binary backed by a local SQLite store (`.urme/db.sqlite` at the project root).
 
 1. **Indexing** — reads Claude Code session logs under `~/.claude/projects/<encoded-project-path>/*.jsonl` and writes one `steps` row per turn with deterministic metadata (files touched, commands run, tokens, `commit_before` / `commit_after`).
 2. **Summarisation** — runs the `claude` CLI (Haiku 4.5, one spawn per batch of 8 turns) to produce a one-sentence summary plus 3–8 tags for each step. Indexed via FTS5.
 3. **Git linkage** — branch-aware `Git_walk` algorithm walks each branch's commits against the Claude Edit / Write tool_use history and populates the `edit_links` table with per-edit → commit linkage. Human edits (content in a commit that no Claude edit explains) are detected by reconciliation.
 4. **Search** — FTS5 + BM25 over `summary`, `tags`, `prompt_text`. The `--smart` and `--deep` modes have Claude rewrite sparse queries and rerank the shortlist with a one-sentence synthesis.
 
-Claude access goes exclusively through the `claude` CLI subprocess — no `ANTHROPIC_API_KEY`, no direct API calls. Uses your Max subscription.
+Claude access goes exclusively through the `claude` CLI subprocess — no `ANTHROPIC_API_KEY`, no direct API calls. Uses your subscription.
 
 ## One-shot questions: `urme ask`
 
