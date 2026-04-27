@@ -213,7 +213,7 @@ let () =
   (try Lwt_engine.set (new Lwt_engine.libev ())
    with Lwt_sys.Not_available _ -> ());
   let doc = "OCaml CLI orchestration layer for Claude + GitHub" in
-  let info = Cmd.info "urme" ~doc ~version:"0.1.1" in
+  let info = Cmd.info "urme" ~doc ~version:"0.1.2" in
   let default = Term.(const default_run $ project_dir) in
   let cmd = Cmd.group ~default info [
     ask_cmd; init_cmd; export_cmd; import_cmd;

@@ -2,7 +2,7 @@
   "mcpServers": {
     "urme": {
       "command": "urme",
-      "args": ["serve", "--project-dir", "/Users/corneliuhoffman/Documents/experience-agent"]
+      "args": []
     }
   }
 }
